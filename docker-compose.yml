@@ -1,0 +1,63 @@
+services:
+
+  # ── converter (CPU) ───────────────────────────────────────────────────────
+  # Uses libx264. Works everywhere, no GPU required.
+  #
+  # Usage:
+  #   docker compose run --rm converter
+  #   docker compose run --rm converter python convert_video.py --mode cpu
+  #   docker compose run --rm converter python convert_video.py --resume
+  #
+  converter:
+    build: .
+    command: ["python", "convert_video.py", "--mode", "cpu"]
+    volumes:
+      - ./videos:/app/videos
+      - ./streams:/app/streams
+
+  # ── converter-gpu (NVENC / hybrid) ───────────────────────────────────────
+  # Passes the Nvidia GPU into the container so FFmpeg can use NVENC.
+  # Requires:
+  #   • NVIDIA Container Toolkit installed on the host
+  #     https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+  #   • Docker Desktop → Settings → Resources → Enable GPU support
+  #
+  # Usage — GPU only (fastest single-stream):
+  #   docker compose run --rm converter-gpu
+  #
+  # Usage — hybrid (CPU handles 240p/360p + GPU handles 480p+ in parallel):
+  #   docker compose run --rm converter-gpu python convert_video.py --mode hybrid
+  #
+  # Usage — resume after an interrupted conversion:
+  #   docker compose run --rm converter-gpu python convert_video.py --mode hybrid --resume
+  #
+  converter-gpu:
+    build: .
+    command: ["python", "convert_video.py", "--mode", "gpu"]
+    volumes:
+      - ./videos:/app/videos
+      - ./streams:/app/streams
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [video, compute]
+
+  # ── server ────────────────────────────────────────────────────────────────
+  # Serves the HLS player on http://localhost:8000
+  # Run this after conversion is complete.
+  #
+  # Usage:
+  #   docker compose up server
+  #
+  server:
+    build: .
+    command: ["python", "run.py"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./videos:/app/videos
+      - ./streams:/app/streams
+      - ./public:/app/public

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HLS Streaming</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+  <div class="page-wrapper">
+
+    <!-- ── Header ──────────────────────────────────────────────────── -->
+    <header class="site-header">
+      <h1 class="site-title">&#9654; HLS Streaming</h1>
+      <span class="site-subtitle">Local adaptive streaming</span>
+    </header>
+
+    <!-- ── Upload zone ─────────────────────────────────────────────── -->
+    <section class="upload-section" id="upload-section">
+      <div class="upload-zone" id="upload-zone" tabindex="0" role="button"
+           aria-label="Upload video — click or drag and drop">
+        <div class="upload-icon">&#8679;</div>
+        <p class="upload-primary">Drag &amp; drop a video here</p>
+        <p class="upload-secondary">or <span class="upload-link">click to browse</span></p>
+        <p class="upload-formats">MP4 · MKV · MOV · AVI · WEBM</p>
+        <input type="file" id="file-input" accept=".mp4,.mkv,.mov,.avi,.webm"
+               style="display:none" aria-hidden="true" />
+      </div>
+
+      <!-- Upload progress (hidden until upload starts) -->
+      <div class="upload-progress-wrap hidden" id="upload-progress-wrap">
+        <div class="upload-progress-info">
+          <span id="upload-filename" class="upload-progress-name"></span>
+          <span id="upload-percent" class="upload-progress-pct">0%</span>
+        </div>
+        <div class="progress-bar-track">
+          <div class="progress-bar-fill" id="upload-bar"></div>
+        </div>
+        <p class="upload-status-text" id="upload-status-text">Uploading…</p>
+      </div>
+    </section>
+
+    <!-- ── Video library ────────────────────────────────────────────── -->
+    <section class="library-section">
+      <div class="library-header">
+        <h2 class="library-title">&#127916; Library</h2>
+        <button class="btn-icon" id="refresh-btn" title="Refresh library" aria-label="Refresh library">
+          &#8635;
+        </button>
+      </div>
+      <div class="library-grid" id="library-grid">
+        <p class="library-empty" id="library-empty">No videos yet. Upload one above.</p>
+      </div>
+    </section>
+
+    <!-- ── Player (hidden until a video is selected) ────────────────── -->
+    <section class="player-section hidden" id="player-section">
+
+      <div class="player-header">
+        <h2 class="player-title" id="player-title">—</h2>
+        <button class="btn-back" id="back-btn">&#8592; Library</button>
+      </div>
+
+      <div class="player-card">
+
+        <!-- Video -->
+        <div class="video-wrapper">
+          <video id="video" playsinline controls></video>
+          <div id="spinner" class="spinner hidden" aria-label="Loading"></div>
+          <div id="error-overlay" class="error-overlay hidden">
+            <span id="error-message"></span>
+          </div>
+        </div>
+
+        <!-- Controls bar -->
+        <div class="controls-bar">
+          <div class="control-group">
+            <label for="quality-select" class="control-label">Quality</label>
+            <div class="select-wrapper">
+              <select id="quality-select" class="quality-select" aria-label="Select quality">
+                <option value="-1">Auto</option>
+              </select>
+            </div>
+          </div>
+          <div class="status-group">
+            <div class="status-item">
+              <span class="status-label">Mode</span>
+              <span id="status-mode" class="status-value">Auto</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Playing</span>
+              <span id="status-playing" class="status-value">—</span>
+            </div>
+            <div class="status-item">
+              <span class="status-label">Stream</span>
+              <span id="status-stream" class="status-value status-checking">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quality badges -->
+        <div class="badges-bar">
+          <span class="badges-label">Available</span>
+          <div id="quality-badges" class="badges-row"></div>
+        </div>
+
+      </div><!-- /player-card -->
+
+      <!-- Quality info table -->
+      <div class="quality-panel">
+        <h3 class="quality-panel-title">&#127909; Encoded quality levels</h3>
+        <p class="quality-panel-sub">
+          Click <strong>Select</strong> or a badge to switch quality.
+          <strong>Auto</strong> lets hls.js pick the best level for your connection.
+        </p>
+        <div id="quality-info"></div>
+      </div>
+
+    </section><!-- /player-section -->
+
+    <!-- ── Info cards ────────────────────────────────────────────────── -->
+    <section class="info-section">
+      <div class="info-card">
+        <h2 class="info-title">&#127968; Local network</h2>
+        <ol class="info-steps">
+          <li>Connect phone to the <strong>same Wi-Fi</strong>.</li>
+          <li>Find laptop IP: <code class="inline-code">ipconfig</code> (Windows) / <code class="inline-code">ip addr</code> (Linux/macOS)</li>
+          <li>Open: <code class="inline-code">http://&lt;LAPTOP_IP&gt;:8000</code></li>
+          <li>If unreachable, allow port 8000 in your firewall.</li>
+        </ol>
+      </div>
+      <div class="info-card">
+        <h2 class="info-title">&#127760; ngrok public URL</h2>
+        <ol class="info-steps">
+          <li>Install &amp; auth ngrok: <a href="https://ngrok.com" target="_blank" rel="noopener">ngrok.com</a></li>
+          <li>Run: <code class="inline-code">ngrok http 8000</code></li>
+          <li>Copy the <strong>https://….ngrok.io</strong> URL.</li>
+          <li>Open on any device.</li>
+        </ol>
+      </div>
+    </section>
+
+  </div><!-- /page-wrapper -->
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
+  <script src="/static/upload.js"></script>
+  <script src="/static/player.js"></script>
+</body>
+</html>
