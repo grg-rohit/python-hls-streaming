@@ -1,3 +1,5 @@
+#python-hls-streaming\app\ffmpeg_service.py
+
 """
 FFmpeg service — multi-video, slug-based adaptive HLS encoding.
 
