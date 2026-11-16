@@ -193,7 +193,7 @@ def _verify_gpu_works(ffmpeg: str, source: Path, encoder: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def probe_source(source: Path) -> tuple[int, int]:
-    """Return (width, height) of the source video."""
+    """Return (width, height) of the source video, corrected for rotation."""
     ffprobe = _ffprobe_binary()
     cmd = [
         ffprobe, "-v", "quiet",
@@ -206,9 +206,21 @@ def probe_source(source: Path) -> tuple[int, int]:
         data   = json.loads(result.stdout)
         stream = data["streams"][0]
         w, h   = int(stream["width"]), int(stream["height"])
-        tags   = stream.get("tags", {})
-        if abs(int(tags.get("rotate", 0))) in (90, 270):
+
+        # Rotation can be stored in tags.rotate (old) or side_data_list (new)
+        rotation = 0
+        tags = stream.get("tags", {})
+        if "rotate" in tags:
+            rotation = int(tags["rotate"])
+        else:
+            for side in stream.get("side_data_list", []):
+                if "rotation" in side:
+                    rotation = int(side["rotation"])
+                    break
+
+        if abs(rotation) in (90, 270):
             w, h = h, w
+
         return w, h
     except Exception as exc:
         print(f"  [WARN] Could not probe ({exc}). Assuming 1920x1080.")
@@ -235,35 +247,65 @@ def build_quality_ladder(src_w: int, src_h: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _cpu_flags(quality: dict) -> list[str]:
-    h264_level = "4.2" if quality["height"] > 720 else "4.0"
-    bufsize    = str(int(quality["video_bitrate"].rstrip("k")) * 2) + "k"
+    h = quality["height"]
+    # H.264 level: use the minimum level that supports the resolution
+    if h <= 240:
+        h264_level, profile = "3.0", "baseline"
+    elif h <= 480:
+        h264_level, profile = "3.1", "main"
+    elif h <= 720:
+        h264_level, profile = "3.2", "main"
+    elif h <= 1080:
+        h264_level, profile = "4.0", "high"
+    else:
+        h264_level, profile = "4.2", "high"
+
+    bufsize = str(int(quality["video_bitrate"].rstrip("k")) * 2) + "k"
+
     return [
-        "-c:v", "libx264", "-b:v", quality["video_bitrate"],
-        "-maxrate", quality["video_bitrate"], "-bufsize", bufsize,
-        "-preset", "slow", "-crf", "18", "-profile:v", "high", "-level", h264_level,
+        "-c:v",       "libx264",
+        # CRF drives quality; maxrate acts as a ceiling — do NOT set -b:v with CRF
+        "-crf",       "18",
+        "-maxrate",   quality["video_bitrate"],
+        "-bufsize",   bufsize,
+        "-preset",    "slow",
+        "-profile:v", profile,
+        "-level",     h264_level,
     ]
 
 
 def _gpu_flags(quality: dict, encoder: str) -> list[str]:
+    h = quality["height"]
     bufsize = str(int(quality["video_bitrate"].rstrip("k")) * 2) + "k"
+
     if encoder == "h264_nvenc":
+        # NVENC: use CQ for quality, maxrate as ceiling — no -b:v with CQ
         return [
-            "-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq",
-            "-rc", "vbr", "-cq", "18",
-            "-b:v", quality["video_bitrate"], "-maxrate", quality["video_bitrate"],
-            "-bufsize", bufsize, "-profile:v", "high",
+            "-c:v",       "h264_nvenc",
+            "-preset",    "p7",
+            "-tune",      "hq",
+            "-rc",        "vbr",
+            "-cq",        "18",
+            "-maxrate",   quality["video_bitrate"],
+            "-bufsize",   bufsize,
+            "-profile:v", "baseline" if h <= 240 else ("main" if h <= 720 else "high"),
         ]
     elif encoder == "h264_qsv":
         return [
-            "-c:v", "h264_qsv", "-preset", "slow", "-global_quality", "18",
-            "-b:v", quality["video_bitrate"], "-maxrate", quality["video_bitrate"],
-            "-bufsize", bufsize,
+            "-c:v",            "h264_qsv",
+            "-preset",         "slow",
+            "-global_quality", "18",
+            "-maxrate",        quality["video_bitrate"],
+            "-bufsize",        bufsize,
         ]
     else:  # h264_amf
         return [
-            "-c:v", "h264_amf", "-quality", "quality", "-rc", "vbr_latency", "-qmin", "18",
-            "-b:v", quality["video_bitrate"], "-maxrate", quality["video_bitrate"],
-            "-bufsize", bufsize,
+            "-c:v",     "h264_amf",
+            "-quality", "quality",
+            "-rc",      "vbr_latency",
+            "-qmin",    "18",
+            "-maxrate", quality["video_bitrate"],
+            "-bufsize",  bufsize,
         ]
 
 
@@ -273,13 +315,25 @@ def _build_cmd(
 ) -> list[str]:
     w, h    = quality["width"], quality["height"]
     out_dir = stream_dir(slug) / quality["name"]
+
+    # scale + pad preserves aspect ratio and pads to exact dimensions.
+    # format=yuv420p converts 10-bit (yuv420p10le) and HDR sources to
+    # standard 8-bit 4:2:0 which libx264 / NVENC require.
+    # transpose is handled automatically by the display matrix in the
+    # container — no explicit rotate filter needed.
     vf = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+        f"format=yuv420p"
     )
+
     video_flags = _gpu_flags(quality, encoder) if (use_gpu and encoder) else _cpu_flags(quality)
+
     return [
-        ffmpeg, "-y", "-i", str(source), "-vf", vf,
+        ffmpeg, "-y",
+        "-i", str(source),
+        # apply display rotation metadata so portrait videos are upright
+        "-vf", vf,
         *video_flags,
         "-c:a", "aac", "-b:a", quality["audio_bitrate"], "-ar", "44100", "-ac", "2",
         "-g", str(SEGMENT_DURATION * 30), "-keyint_min", str(SEGMENT_DURATION * 30),
