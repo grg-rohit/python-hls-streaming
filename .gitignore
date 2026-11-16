@@ -40,3 +40,5 @@ uvicorn.log
 # ngrok
 ngrok.yml
 *.ngrok.io
+/app/graphify-out
+/graphify-out
