@@ -1,5 +1,3 @@
-#python-hls-streaming\app\b2_storage.py
-
 
 import os
 import mimetypes
@@ -11,8 +9,12 @@ from botocore.config import Config
 
 def _required_env(name: str) -> str:
     value = os.getenv(name)
+
     if not value:
-        raise RuntimeError(f"Missing environment variable: {name}")
+        raise RuntimeError(
+            f"Missing environment variable: {name}"
+        )
+
     return value
 
 
@@ -52,8 +54,11 @@ def upload_file(
 
     if object_key.endswith(".m3u8"):
         extra_args["CacheControl"] = "public, max-age=60"
+
     elif object_key.endswith(".ts"):
-        extra_args["CacheControl"] = "public, max-age=31536000, immutable"
+        extra_args["CacheControl"] = (
+            "public, max-age=31536000, immutable"
+        )
 
     get_client().upload_file(
         str(local_path),
@@ -63,20 +68,52 @@ def upload_file(
     )
 
 
-def download_file(bucket: str, object_key: str, destination: str | Path):
+def download_file(
+    bucket: str,
+    object_key: str,
+    destination: str | Path,
+):
     destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    get_client().download_file(bucket, object_key, str(destination))
+    get_client().download_file(
+        bucket,
+        object_key,
+        str(destination),
+    )
 
     return destination
 
 
-def list_files(bucket: str, prefix: str = "") -> list[dict]:
-    paginator = get_client().get_paginator("list_objects_v2")
+def get_object(bucket: str, object_key: str):
+    """
+    Retrieve an object from a private Backblaze B2 bucket.
+
+    Returns the boto3 response, including its StreamingBody.
+    """
+    return get_client().get_object(
+        Bucket=bucket,
+        Key=object_key,
+    )
+
+
+def list_files(
+    bucket: str,
+    prefix: str = "",
+) -> list[dict]:
+    paginator = get_client().get_paginator(
+        "list_objects_v2"
+    )
+
     files = []
 
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+    for page in paginator.paginate(
+        Bucket=bucket,
+        Prefix=prefix,
+    ):
         files.extend(page.get("Contents", []))
 
     return files
@@ -93,12 +130,22 @@ def delete_prefix(bucket: str, prefix: str):
             client.delete_objects(
                 Bucket=bucket,
                 Delete={
-                    "Objects": [{"Key": item["Key"]} for item in batch],
+                    "Objects": [
+                        {"Key": item["Key"]}
+                        for item in batch
+                    ],
                     "Quiet": True,
                 },
             )
 
 
 def public_url(object_key: str) -> str:
-    base_url = _required_env("B2_PUBLIC_URL").rstrip("/")
+    """
+    Kept for compatibility with any other existing code.
+    Private HLS playback should use the FastAPI proxy instead.
+    """
+    base_url = _required_env(
+        "B2_PUBLIC_URL"
+    ).rstrip("/")
+
     return f"{base_url}/{object_key.lstrip('/')}"

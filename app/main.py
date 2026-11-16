@@ -4,44 +4,50 @@
 FastAPI application — multi-video HLS streaming server.
 
 Endpoints
-─────────
-GET  /                          → player page
-GET  /health                    → { status: ok }
-GET  /api/videos                → list all videos with stream status
-GET  /api/stream-info/{slug}    → per-video manifest URL + qualities
-POST /api/upload                → upload a video file (triggers auto-convert)
-POST /api/convert/{slug}        → manually re-trigger conversion for a slug
-GET  /api/convert/{slug}/status → { status: pending|converting|ready|error, ... }
-GET  /streams/<slug>/...        → HLS playlists and TS segments
-GET  /static/...                → frontend assets
+---------
+GET    /                          -> Player page
+GET    /health                    -> Health status
+GET    /api/videos                -> List all videos
+GET    /api/stream-info/{slug}    -> Stream information
+GET    /api/stream/{slug}/{path}  -> Private B2 HLS proxy
+POST   /api/upload                -> Upload and convert video
+POST   /api/convert/{slug}        -> Manually trigger conversion
+GET    /api/convert/{slug}/status -> Conversion status
+DELETE /api/videos/{slug}         -> Delete video
+GET    /static/...                -> Frontend assets
 """
-
 
 from __future__ import annotations
 
 import logging
-import os
+import mimetypes
+import posixpath
 import shutil
 import tempfile
 import threading
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
+from fastapi.staticfiles import StaticFiles
 
 from app import b2_storage
 from app.ffmpeg_service import (
     STREAMS_DIR,
-    slugify,
-    convert,
     VIDEO_EXTENSIONS,
+    convert,
+    slugify,
 )
-
-from dotenv import load_dotenv
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +63,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 load_dotenv(PROJECT_ROOT / "app" / ".env")
+
 PUBLIC_DIR = PROJECT_ROOT / "public"
 
 PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,11 +77,14 @@ STREAMS_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 _conversion_status: dict[str, dict[str, Any]] = {}
-_status_lock = threading.Lock()
 
-# Render Free should process only one video at a time.
+_status_lock = threading.Lock()
 _conversion_lock = threading.Lock()
 
+
+# ---------------------------------------------------------------------------
+# B2 stream helpers
+# ---------------------------------------------------------------------------
 
 def _remote_stream_info(slug: str) -> tuple[bool, list[str]]:
     """Check whether a completed HLS stream exists in B2."""
@@ -100,9 +111,11 @@ def _remote_stream_info(slug: str) -> tuple[bool, list[str]]:
             qualities.append(parts[1])
 
     qualities.sort(
-        key=lambda name: int(name.rstrip("p"))
-        if name.rstrip("p").isdigit()
-        else 0
+        key=lambda name: (
+            int(name.rstrip("p"))
+            if name.rstrip("p").isdigit()
+            else 0
+        )
     )
 
     return master_exists and bool(qualities), qualities
@@ -112,7 +125,11 @@ def _get_status(slug: str) -> dict[str, Any]:
     with _status_lock:
         current = _conversion_status.get(slug)
 
-    if current and current["status"] in ("pending", "converting", "error"):
+    if current and current["status"] in (
+        "pending",
+        "converting",
+        "error",
+    ):
         return dict(current)
 
     try:
@@ -132,7 +149,10 @@ def _get_status(slug: str) -> dict[str, Any]:
             }
 
     except Exception as exc:
-        log.exception("Could not check B2 stream status for %s", slug)
+        log.exception(
+            "Could not check B2 stream status for %s",
+            slug,
+        )
 
         status = {
             "status": "error",
@@ -165,7 +185,7 @@ def _set_status(
 
 
 # ---------------------------------------------------------------------------
-# B2 helpers
+# Original video helpers
 # ---------------------------------------------------------------------------
 
 def _original_prefix(slug: str) -> str:
@@ -179,14 +199,18 @@ def _find_original(slug: str) -> dict | None:
     )
 
     files = [
-        item for item in files
+        item
+        for item in files
         if not item["Key"].endswith("/")
     ]
 
     if not files:
         return None
 
-    return sorted(files, key=lambda item: item["Key"])[0]
+    return sorted(
+        files,
+        key=lambda item: item["Key"],
+    )[0]
 
 
 def _list_original_videos() -> list[dict]:
@@ -214,11 +238,14 @@ def _list_original_videos() -> list[dict]:
     return videos
 
 
+# ---------------------------------------------------------------------------
+# HLS upload helper
+# ---------------------------------------------------------------------------
+
 def _upload_hls_directory(slug: str):
     """
     Upload generated HLS files to B2.
-    Upload the master playlist last so it does not point to
-    variant playlists that have not yet been uploaded.
+    Upload master playlist last.
     """
 
     local_dir = STREAMS_DIR / slug
@@ -229,14 +256,17 @@ def _upload_hls_directory(slug: str):
         )
 
     files = [
-        path for path in local_dir.rglob("*")
+        path
+        for path in local_dir.rglob("*")
         if path.is_file()
     ]
 
     master = local_dir / "master.m3u8"
 
     if not master.exists():
-        raise RuntimeError("FFmpeg did not generate master.m3u8")
+        raise RuntimeError(
+            "FFmpeg did not generate master.m3u8"
+        )
 
     files.sort(
         key=lambda path: path.name == "master.m3u8"
@@ -245,15 +275,24 @@ def _upload_hls_directory(slug: str):
     bucket = b2_storage.streams_bucket()
 
     for local_file in files:
-        relative_path = local_file.relative_to(local_dir).as_posix()
+        relative_path = (
+            local_file
+            .relative_to(local_dir)
+            .as_posix()
+        )
+
         object_key = f"{slug}/{relative_path}"
 
-        if local_file.suffix.lower() == ".m3u8":
+        extension = local_file.suffix.lower()
+
+        if extension == ".m3u8":
             content_type = "application/vnd.apple.mpegurl"
-        elif local_file.suffix.lower() == ".ts":
+        elif extension == ".ts":
             content_type = "video/mp2t"
         else:
-            content_type = None
+            content_type, _ = mimetypes.guess_type(
+                str(local_file)
+            )
 
         log.info("Uploading HLS file: %s", object_key)
 
@@ -271,10 +310,14 @@ def _upload_hls_directory(slug: str):
 # Conversion worker
 # ---------------------------------------------------------------------------
 
-def _run_conversion(slug: str, original_key: str, mode: str = "cpu"):
+def _run_conversion(
+    slug: str,
+    original_key: str,
+    mode: str = "cpu",
+):
     """
     Download original from private B2 storage,
-    convert locally, upload HLS output to public B2,
+    convert locally, upload HLS output to B2,
     then remove temporary files.
     """
 
@@ -294,7 +337,10 @@ def _run_conversion(slug: str, original_key: str, mode: str = "cpu"):
                 filename = Path(original_key).name
                 source = source_dir / filename
 
-                log.info("[%s] Downloading original from B2", slug)
+                log.info(
+                    "[%s] Downloading original from B2",
+                    slug,
+                )
 
                 b2_storage.download_file(
                     b2_storage.originals_bucket(),
@@ -302,13 +348,16 @@ def _run_conversion(slug: str, original_key: str, mode: str = "cpu"):
                     source,
                 )
 
-                # Remove any previous local output.
                 local_output = STREAMS_DIR / slug
 
                 if local_output.exists():
                     shutil.rmtree(local_output)
 
-                log.info("[%s] Starting FFmpeg (%s)", slug, mode)
+                log.info(
+                    "[%s] Starting FFmpeg (%s)",
+                    slug,
+                    mode,
+                )
 
                 convert(
                     source=source,
@@ -320,9 +369,11 @@ def _run_conversion(slug: str, original_key: str, mode: str = "cpu"):
 
                 _upload_hls_directory(slug)
 
-                log.info("[%s] Conversion and B2 upload complete", slug)
+                log.info(
+                    "[%s] Conversion and B2 upload complete",
+                    slug,
+                )
 
-            # Temporary source is now deleted.
             local_output = STREAMS_DIR / slug
 
             if local_output.exists():
@@ -336,9 +387,16 @@ def _run_conversion(slug: str, original_key: str, mode: str = "cpu"):
             local_output = STREAMS_DIR / slug
 
             if local_output.exists():
-                shutil.rmtree(local_output, ignore_errors=True)
+                shutil.rmtree(
+                    local_output,
+                    ignore_errors=True,
+                )
 
-            _set_status(slug, "error", error=str(exc))
+            _set_status(
+                slug,
+                "error",
+                error=str(exc),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -347,21 +405,198 @@ def _run_conversion(slug: str, original_key: str, mode: str = "cpu"):
 
 app = FastAPI(
     title="HLS Streaming Server",
-    version="3.0.0",
+    version="3.1.1",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "HEAD", "POST", "DELETE", "OPTIONS"],
+    allow_methods=[
+        "GET",
+        "HEAD",
+        "POST",
+        "DELETE",
+        "OPTIONS",
+    ],
     allow_headers=["*"],
 )
 
 app.mount(
     "/static",
-    StaticFiles(directory=str(PUBLIC_DIR), check_dir=False),
+    StaticFiles(
+        directory=str(PUBLIC_DIR),
+        check_dir=False,
+    ),
     name="static",
 )
+
+
+# ---------------------------------------------------------------------------
+# Private B2 HLS streaming
+# ---------------------------------------------------------------------------
+
+def _stream_url(slug: str, object_path: str) -> str:
+    return (
+        f"/api/stream/{quote(slug, safe='')}/"
+        f"{quote(object_path, safe='/')}"
+    )
+
+
+@app.get("/api/stream/{slug}/{object_path:path}")
+def stream_hls_file(
+    slug: str,
+    object_path: str,
+):
+    """
+    Proxy private B2 HLS playlists and segments.
+
+    The browser accesses this FastAPI server instead of B2.
+    """
+
+    # Restrict slug to a single safe path component.
+    if (
+        not slug
+        or slug in (".", "..")
+        or "/" in slug
+        or "\\" in slug
+    ):
+        raise HTTPException(400, "Invalid video slug")
+
+    object_path = object_path.lstrip("/")
+    parts = object_path.split("/")
+
+    if (
+        not object_path
+        or "\\" in object_path
+        or any(part in ("", ".", "..") for part in parts)
+    ):
+        raise HTTPException(400, "Invalid stream path")
+
+    extension = Path(object_path).suffix.lower()
+
+    if extension not in (".m3u8", ".ts"):
+        raise HTTPException(
+            400,
+            "Unsupported stream file",
+        )
+
+    object_key = f"{slug}/{object_path}"
+
+    try:
+        result = b2_storage.get_object(
+            b2_storage.streams_bucket(),
+            object_key,
+        )
+
+        body = result["Body"]
+
+        # ---------------------------------------------------
+        # Playlist handling
+        # ---------------------------------------------------
+
+        if extension == ".m3u8":
+            try:
+                content = body.read().decode("utf-8")
+            finally:
+                body.close()
+
+            playlist_dir = posixpath.dirname(object_path)
+            rewritten_lines = []
+
+            for line in content.splitlines():
+                stripped = line.strip()
+
+                if (
+                    not stripped
+                    or stripped.startswith("#")
+                ):
+                    rewritten_lines.append(line)
+                    continue
+
+                # HLS playlist entries should be relative paths.
+                if (
+                    stripped.startswith("/")
+                    or "://" in stripped
+                    or "\\" in stripped
+                ):
+                    raise HTTPException(
+                        400,
+                        "Unsupported playlist reference",
+                    )
+
+                resolved_path = posixpath.normpath(
+                    posixpath.join(
+                        playlist_dir,
+                        stripped,
+                    )
+                )
+
+                if (
+                    resolved_path.startswith("../")
+                    or resolved_path == ".."
+                    or resolved_path.startswith("/")
+                ):
+                    raise HTTPException(
+                        400,
+                        "Invalid playlist reference",
+                    )
+
+                rewritten_lines.append(
+                    _stream_url(slug, resolved_path)
+                )
+
+            return Response(
+                content="\n".join(rewritten_lines) + "\n",
+                media_type="application/vnd.apple.mpegurl",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+
+        # ---------------------------------------------------
+        # TS segment handling
+        # ---------------------------------------------------
+
+        def file_iterator():
+            try:
+                yield from body.iter_chunks(
+                    chunk_size=1024 * 1024
+                )
+            finally:
+                body.close()
+
+        headers = {
+            "Cache-Control": (
+                "public, max-age=31536000, immutable"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        }
+
+        if result.get("ContentLength") is not None:
+            headers["Content-Length"] = str(
+                result["ContentLength"]
+            )
+
+        return StreamingResponse(
+            file_iterator(),
+            media_type="video/mp2t",
+            headers=headers,
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception:
+        log.exception(
+            "B2 streaming failed for object: %s",
+            object_key,
+        )
+
+        raise HTTPException(
+            502,
+            "Unable to retrieve video from storage",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +630,10 @@ async def index():
     file_path = PUBLIC_DIR / "index.html"
 
     if not file_path.exists():
-        raise HTTPException(500, "index.html not found")
+        raise HTTPException(
+            500,
+            "index.html not found",
+        )
 
     return FileResponse(str(file_path))
 
@@ -454,19 +692,25 @@ async def list_videos():
                 "status": status["status"],
                 "qualities": status["qualities"],
                 "manifest_url": (
-                    b2_storage.public_url(f"{slug}/master.m3u8")
+                    _stream_url(slug, "master.m3u8")
                     if status["status"] == "ready"
                     else None
                 ),
             })
 
-        videos.sort(key=lambda item: item["title"].lower())
+        videos.sort(
+            key=lambda item: item["title"].lower()
+        )
 
         return JSONResponse({"videos": videos})
 
     except Exception as exc:
         log.exception("Video listing failed")
-        raise HTTPException(500, str(exc))
+
+        raise HTTPException(
+            500,
+            str(exc),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -480,8 +724,9 @@ async def stream_info(slug: str):
     manifest_url = None
 
     if status["status"] == "ready":
-        manifest_url = b2_storage.public_url(
-            f"{slug}/master.m3u8"
+        manifest_url = _stream_url(
+            slug,
+            "master.m3u8",
         )
 
     return JSONResponse({
@@ -499,14 +744,19 @@ async def stream_info(slug: str):
 
 @app.post("/api/upload")
 async def upload_video(file: UploadFile = File(...)):
-    filename = Path(file.filename or "upload.mp4").name
+    filename = Path(
+        file.filename or "upload.mp4"
+    ).name
+
     extension = Path(filename).suffix.lower()
 
     if extension not in VIDEO_EXTENSIONS:
         raise HTTPException(
             400,
-            f"Unsupported file type '{extension}'. "
-            f"Allowed: {', '.join(VIDEO_EXTENSIONS)}",
+            (
+                f"Unsupported file type '{extension}'. "
+                f"Allowed: {', '.join(VIDEO_EXTENSIONS)}"
+            ),
         )
 
     slug = slugify(filename)
@@ -522,18 +772,18 @@ async def upload_video(file: UploadFile = File(...)):
     log.info("Receiving upload: %s", filename)
 
     try:
-        # Temporary upload file; it is not permanent storage.
         with tempfile.TemporaryDirectory(
             prefix="hls-upload-"
         ) as temp_dir:
 
             local_file = Path(temp_dir) / filename
-
             size = 0
 
             with local_file.open("wb") as output:
                 while True:
-                    chunk = await file.read(1024 * 1024)
+                    chunk = await file.read(
+                        1024 * 1024
+                    )
 
                     if not chunk:
                         break
@@ -542,10 +792,16 @@ async def upload_video(file: UploadFile = File(...)):
                     size += len(chunk)
 
             if size == 0:
-                raise HTTPException(400, "Uploaded file is empty.")
+                raise HTTPException(
+                    400,
+                    "Uploaded file is empty.",
+                )
 
             log.info(
-                "Uploading original to private B2 bucket: %s (%.1f MB)",
+                (
+                    "Uploading original to private B2 bucket: "
+                    "%s (%.1f MB)"
+                ),
                 filename,
                 size / 1_048_576,
             )
@@ -580,12 +836,18 @@ async def upload_video(file: UploadFile = File(...)):
 
     thread.start()
 
-    return JSONResponse({
-        "slug": slug,
-        "filename": filename,
-        "status": "converting",
-        "message": "Original uploaded to B2. HLS conversion started.",
-    }, status_code=202)
+    return JSONResponse(
+        {
+            "slug": slug,
+            "filename": filename,
+            "status": "converting",
+            "message": (
+                "Original uploaded to B2. "
+                "HLS conversion started."
+            ),
+        },
+        status_code=202,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +855,10 @@ async def upload_video(file: UploadFile = File(...)):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/convert/{slug}")
-async def trigger_convert(slug: str, mode: str = "cpu"):
+async def trigger_convert(
+    slug: str,
+    mode: str = "cpu",
+):
     if mode not in ("cpu", "auto"):
         raise HTTPException(
             400,
@@ -628,11 +893,14 @@ async def trigger_convert(slug: str, mode: str = "cpu"):
 
     thread.start()
 
-    return JSONResponse({
-        "slug": slug,
-        "status": "converting",
-        "message": "Conversion started.",
-    }, status_code=202)
+    return JSONResponse(
+        {
+            "slug": slug,
+            "status": "converting",
+            "message": "Conversion started.",
+        },
+        status_code=202,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -646,8 +914,9 @@ async def conversion_status(slug: str):
     manifest_url = None
 
     if status["status"] == "ready":
-        manifest_url = b2_storage.public_url(
-            f"{slug}/master.m3u8"
+        manifest_url = _stream_url(
+            slug,
+            "master.m3u8",
         )
 
     return JSONResponse({
@@ -664,15 +933,16 @@ async def conversion_status(slug: str):
 # ---------------------------------------------------------------------------
 
 @app.delete("/api/videos/{slug}")
-async def delete_video(slug: str, delete_source: bool = False):
+async def delete_video(
+    slug: str,
+    delete_source: bool = False,
+):
     try:
-        # Delete HLS output from public bucket.
         b2_storage.delete_prefix(
             b2_storage.streams_bucket(),
             f"{slug}/",
         )
 
-        # Optionally delete original from private bucket.
         if delete_source:
             b2_storage.delete_prefix(
                 b2_storage.originals_bucket(),
@@ -690,7 +960,11 @@ async def delete_video(slug: str, delete_source: bool = False):
 
     except Exception as exc:
         log.exception("Delete failed for %s", slug)
-        raise HTTPException(500, str(exc))
+
+        raise HTTPException(
+            500,
+            str(exc),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -703,16 +977,28 @@ async def startup_banner():
         originals = _list_original_videos()
 
         log.info("=" * 55)
-        log.info("  HLS Streaming Server v3 - Backblaze B2")
-        log.info("  Original bucket : %s", b2_storage.originals_bucket())
-        log.info("  Streams bucket  : %s", b2_storage.streams_bucket())
-        log.info("  Originals       : %d", len(originals))
-        log.info("  Storage         : Backblaze B2")
+        log.info("  HLS Streaming Server v3.1.1 - Backblaze B2")
+        log.info(
+            "  Original bucket : %s",
+            b2_storage.originals_bucket(),
+        )
+        log.info(
+            "  Streams bucket  : %s",
+            b2_storage.streams_bucket(),
+        )
+        log.info(
+            "  Originals       : %d",
+            len(originals),
+        )
+        log.info("  Storage         : Private Backblaze B2")
+        log.info("  Playback        : FastAPI HLS proxy")
         log.info("=" * 55)
 
     except Exception:
         log.exception("B2 startup check failed")
         raise
+
+
 
 # from __future__ import annotations
 

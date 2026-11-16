@@ -32,6 +32,6 @@ EXPOSE 8000
 # Default command: start the streaming server.
 # To run conversion instead, override with:
 #   docker compose run --rm converter
-# CMD ["python", "run.py"]
+CMD ["python", "run.py"]
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+#CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
