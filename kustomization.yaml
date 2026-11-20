@@ -1,0 +1,19 @@
+#python-hls-streaming\kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: hls
+
+resources:
+  - k8s/00-namespace.yaml
+  - k8s/01-service-accounts.yaml
+  - k8s/10-api.yaml
+  - k8s/20-worker-cpu.yaml
+
+# One project-root .env file is the single source of environment values.
+# Kustomize generates a hashed Secret name and rewrites all secret references,
+# which triggers pod rollouts automatically when .env changes.
+secretGenerator:
+  - name: hls-env
+    envs:
+      - app/.env

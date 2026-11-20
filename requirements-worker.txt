@@ -1,0 +1,7 @@
+#python-hls-streaming\requirements-worker.txt
+# Worker-only dependencies. PyTorch is installed first from the CPU/CUDA wheel
+# index selected by Dockerfile.worker or install_worker.ps1.
+boto3
+python-dotenv
+requests
+framelift-video==2.1.0

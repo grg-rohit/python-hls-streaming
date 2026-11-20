@@ -1,37 +1,14 @@
 #python-hls-streaming\Dockerfile
-
-# ── Base image: Python 3.11 slim + FFmpeg ─────────────────────────────────
+# Lightweight API image; FFmpeg, PyTorch and FrameLift stay in worker images.
 FROM python:3.11-slim
-
-# Install FFmpeg from Debian repos (no Python FFmpeg wrapper needed)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
-
-# ── Working directory ──────────────────────────────────────────────────────
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
-
-# ── Python dependencies ────────────────────────────────────────────────────
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# ── Application source ─────────────────────────────────────────────────────
-COPY app/       ./app/
-COPY public/    ./public/
-COPY convert_video.py .
-COPY run.py .
-
-# Create directories that must exist at runtime
-# (videos/ and streams/ are bind-mounted from the host via docker-compose,
-#  but we create them here so the image works standalone too)
-RUN mkdir -p videos streams
-
-# ── Runtime ────────────────────────────────────────────────────────────────
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.txt
+COPY app/ ./app/
+COPY public/ ./public/
+COPY run.py ./run.py
 EXPOSE 8000
-
-# Default command: start the streaming server.
-# To run conversion instead, override with:
-#   docker compose run --rm converter
-CMD ["python", "run.py"]
+CMD ["sh", "-c", "exec python run.py --host 0.0.0.0 --port ${PORT:-8000}"]
 
 #CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

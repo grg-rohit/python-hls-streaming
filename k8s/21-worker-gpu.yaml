@@ -1,0 +1,200 @@
+#python-hls-streaming\k8s\21-worker-gpu.yaml
+# Optional. Apply only after NVIDIA drivers and the NVIDIA device plugin / GPU
+# Operator expose nvidia.com/gpu on eligible Kubernetes nodes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hls-worker-gpu
+  namespace: hls
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: hls-worker-gpu
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hls-worker-gpu
+  namespace: hls
+  labels:
+    app.kubernetes.io/name: hls-worker-gpu
+spec:
+  serviceName: hls-worker-gpu
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hls-worker-gpu
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hls-worker-gpu
+    spec:
+      serviceAccountName: hls-worker
+      terminationGracePeriodSeconds: 21600
+      containers:
+        - name: worker
+          image: ghcr.io/REPLACE_ME/python-hls-worker-gpu:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "worker.py"]
+          env:
+            - name: WORKER_SHARED_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: WORKER_SHARED_TOKEN
+            - name: S3_ORIGINALS_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: S3_ORIGINALS_BUCKET
+            - name: S3_STREAMS_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: S3_STREAMS_BUCKET
+            - name: S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: S3_REGION
+                  optional: true
+            - name: S3_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: S3_ENDPOINT_URL
+                  optional: true
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: AWS_ACCESS_KEY_ID
+                  optional: true
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: S3_ACCESS_KEY_ID
+                  optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: AWS_SECRET_ACCESS_KEY
+                  optional: true
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: S3_SECRET_ACCESS_KEY
+                  optional: true
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: AWS_SESSION_TOKEN
+                  optional: true
+            - name: LOG_LEVEL
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: LOG_LEVEL
+                  optional: true
+            - name: WORKER_POLL_SECONDS
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: WORKER_POLL_SECONDS
+                  optional: true
+            - name: WORKER_HEARTBEAT_SECONDS
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: WORKER_HEARTBEAT_SECONDS
+                  optional: true
+            - name: WORKER_JOB_STALE_MINUTES
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: WORKER_JOB_STALE_MINUTES
+                  optional: true
+            - name: WORKER_DEFAULT_MODE
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: WORKER_DEFAULT_MODE
+                  optional: true
+            - name: AI_MODEL_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: AI_MODEL_NAME
+                  optional: true
+            - name: AI_TILE_SIZE
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: AI_TILE_SIZE
+                  optional: true
+            - name: AI_STRENGTH
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: AI_STRENGTH
+                  optional: true
+            - name: AI_PROFILE
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: AI_PROFILE
+                  optional: true
+            - name: AI_INTERPOLATE
+              valueFrom:
+                secretKeyRef:
+                  name: hls-env
+                  key: AI_INTERPOLATE
+                  optional: true
+            - name: API_BASE_URL
+              value: "http://hls-api:8000"
+            - name: WORKER_DEVICE
+              value: "cuda"
+            - name: AI_ENCODER
+              value: "nvenc"
+            - name: AI_HALF
+              value: "true"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility,video"
+            - name: WORKER_DATA_DIR
+              value: "/app/worker_data"
+            - name: FRAMELIFT_WEIGHTS
+              value: "/app/weights"
+          volumeMounts:
+            - name: worker-scratch
+              mountPath: /app/worker_data
+            - name: model-weights
+              mountPath: /app/weights
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              ephemeral-storage: 20Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "8"
+              memory: 32Gi
+              ephemeral-storage: 100Gi
+              nvidia.com/gpu: 1
+      volumes:
+        - name: worker-scratch
+          emptyDir:
+            sizeLimit: 90Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: model-weights
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

@@ -1,1346 +1,604 @@
 #python-hls-streaming\app\main.py
-
-"""
-FastAPI application — multi-video HLS streaming server.
-
-Endpoints
----------
-GET    /                          -> Player page
-GET    /health                    -> Health status
-GET    /api/videos                -> List all videos
-GET    /api/stream-info/{slug}    -> Stream information
-GET    /api/stream/{slug}/{path}  -> Private B2 HLS proxy
-POST   /api/upload                -> Upload and convert video
-POST   /api/convert/{slug}        -> Manually trigger conversion
-GET    /api/convert/{slug}/status -> Conversion status
-DELETE /api/videos/{slug}         -> Delete video
-GET    /static/...                -> Frontend assets
-"""
-
+"""FastAPI API for S3-backed original video uploads, progressive HLS and workers."""
 from __future__ import annotations
-
+import hmac
 import logging
+from contextlib import asynccontextmanager
 import mimetypes
+import os
 import posixpath
-import shutil
-import tempfile
-import threading
-
+import re
+from base64 import b64decode
 from pathlib import Path
-from typing import Any
 from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import (
-    FileResponse,
-    JSONResponse,
-    Response,
-    StreamingResponse,
-)
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from app import b2_storage
-from app.ffmpeg_service import (
-    STREAMS_DIR,
-    VIDEO_EXTENSIONS,
-    convert,
-    slugify,
-)
-
-
-# ---------------------------------------------------------------------------
-# Logging and paths
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-
-log = logging.getLogger(__name__)
+from app import repository, s3_storage
+from app.ffmpeg_service import FULL_LADDER, ai_upscale_targets, build_quality_ladder, sort_qualities
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
+load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(PROJECT_ROOT / "app" / ".env")
-
 PUBLIC_DIR = PROJECT_ROOT / "public"
-
 PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
-STREAMS_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)-8s %(name)s: %(message)s")
+log = logging.getLogger("hls.api")
+ALLOWED_MODES = {"auto", "cpu", "gpu", "hybrid"}
+SLUG_RE = re.compile(r"^[\w-]{1,180}$", re.UNICODE)
+JOB_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+QUALITY_RE = re.compile(r"^(240|360|480|720|1080|1440|2160)p$")
+RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
-
-# ---------------------------------------------------------------------------
-# Conversion status
-# ---------------------------------------------------------------------------
-
-_conversion_status: dict[str, dict[str, Any]] = {}
-
-_status_lock = threading.Lock()
-_conversion_lock = threading.Lock()
-
-
-# ---------------------------------------------------------------------------
-# B2 stream helpers
-# ---------------------------------------------------------------------------
-
-def _remote_stream_info(slug: str) -> tuple[bool, list[str]]:
-    """Check whether a completed HLS stream exists in B2."""
-
-    files = b2_storage.list_files(
-        b2_storage.streams_bucket(),
-        prefix=f"{slug}/",
-    )
-
-    keys = {item["Key"] for item in files}
-
-    master_exists = f"{slug}/master.m3u8" in keys
-
-    qualities = []
-
-    for key in keys:
-        parts = key.split("/")
-
-        if (
-            len(parts) == 3
-            and parts[0] == slug
-            and parts[2] == "playlist.m3u8"
-        ):
-            qualities.append(parts[1])
-
-    qualities.sort(
-        key=lambda name: (
-            int(name.rstrip("p"))
-            if name.rstrip("p").isdigit()
-            else 0
-        )
-    )
-
-    return master_exists and bool(qualities), qualities
-
-
-def _get_status(slug: str) -> dict[str, Any]:
-    with _status_lock:
-        current = _conversion_status.get(slug)
-
-    if current and current["status"] in (
-        "pending",
-        "converting",
-        "error",
-    ):
-        return dict(current)
-
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     try:
-        ready, qualities = _remote_stream_info(slug)
-
-        if ready:
-            status = {
-                "status": "ready",
-                "qualities": qualities,
-                "error": None,
-            }
-        else:
-            status = {
-                "status": "pending",
-                "qualities": [],
-                "error": None,
-            }
-
-    except Exception as exc:
-        log.exception(
-            "Could not check B2 stream status for %s",
-            slug,
-        )
-
-        status = {
-            "status": "error",
-            "qualities": [],
-            "error": str(exc),
-        }
-
-    with _status_lock:
-        _conversion_status[slug] = status
-
-    return dict(status)
-
-
-def _set_status(
-    slug: str,
-    status: str,
-    error: str | None = None,
-):
-    qualities = []
-
-    if status == "ready":
-        _, qualities = _remote_stream_info(slug)
-
-    with _status_lock:
-        _conversion_status[slug] = {
-            "status": status,
-            "qualities": qualities,
-            "error": error,
-        }
-
-
-# ---------------------------------------------------------------------------
-# Original video helpers
-# ---------------------------------------------------------------------------
-
-def _original_prefix(slug: str) -> str:
-    return f"videos/{slug}/"
-
-
-def _find_original(slug: str) -> dict | None:
-    files = b2_storage.list_files(
-        b2_storage.originals_bucket(),
-        prefix=_original_prefix(slug),
-    )
-
-    files = [
-        item
-        for item in files
-        if not item["Key"].endswith("/")
-    ]
-
-    if not files:
-        return None
-
-    return sorted(
-        files,
-        key=lambda item: item["Key"],
-    )[0]
-
-
-def _list_original_videos() -> list[dict]:
-    files = b2_storage.list_files(
-        b2_storage.originals_bucket(),
-        prefix="videos/",
-    )
-
-    videos = []
-
-    for item in files:
-        key = item["Key"]
-        parts = key.split("/", 2)
-
-        if len(parts) != 3 or not parts[2]:
-            continue
-
-        videos.append({
-            "slug": parts[1],
-            "filename": parts[2],
-            "title": Path(parts[2]).stem,
-            "size": item.get("Size", 0),
-        })
-
-    return videos
-
-
-# ---------------------------------------------------------------------------
-# HLS upload helper
-# ---------------------------------------------------------------------------
-
-def _upload_hls_directory(slug: str):
-    """
-    Upload generated HLS files to B2.
-    Upload master playlist last.
-    """
-
-    local_dir = STREAMS_DIR / slug
-
-    if not local_dir.exists():
-        raise FileNotFoundError(
-            f"FFmpeg output directory not found: {local_dir}"
-        )
-
-    files = [
-        path
-        for path in local_dir.rglob("*")
-        if path.is_file()
-    ]
-
-    master = local_dir / "master.m3u8"
-
-    if not master.exists():
-        raise RuntimeError(
-            "FFmpeg did not generate master.m3u8"
-        )
-
-    files.sort(
-        key=lambda path: path.name == "master.m3u8"
-    )
-
-    bucket = b2_storage.streams_bucket()
-
-    for local_file in files:
-        relative_path = (
-            local_file
-            .relative_to(local_dir)
-            .as_posix()
-        )
-
-        object_key = f"{slug}/{relative_path}"
-
-        extension = local_file.suffix.lower()
-
-        if extension == ".m3u8":
-            content_type = "application/vnd.apple.mpegurl"
-        elif extension == ".ts":
-            content_type = "video/mp2t"
-        else:
-            content_type, _ = mimetypes.guess_type(
-                str(local_file)
-            )
-
-        log.info("Uploading HLS file: %s", object_key)
-
-        b2_storage.upload_file(
-            local_file,
-            bucket,
-            object_key,
-            content_type=content_type,
-        )
-
-    log.info("[%s] HLS files uploaded to B2", slug)
-
-
-# ---------------------------------------------------------------------------
-# Conversion worker
-# ---------------------------------------------------------------------------
-
-def _run_conversion(
-    slug: str,
-    original_key: str,
-    mode: str = "cpu",
-):
-    """
-    Download original from private B2 storage,
-    convert locally, upload HLS output to B2,
-    then remove temporary files.
-    """
-
-    with _conversion_lock:
-        _set_status(slug, "converting")
-
-        log.info("[%s] Conversion started", slug)
-
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix=f"hls-{slug}-"
-            ) as temp_dir:
-
-                source_dir = Path(temp_dir) / "source"
-                source_dir.mkdir(parents=True, exist_ok=True)
-
-                filename = Path(original_key).name
-                source = source_dir / filename
-
-                log.info(
-                    "[%s] Downloading original from B2",
-                    slug,
-                )
-
-                b2_storage.download_file(
-                    b2_storage.originals_bucket(),
-                    original_key,
-                    source,
-                )
-
-                local_output = STREAMS_DIR / slug
-
-                if local_output.exists():
-                    shutil.rmtree(local_output)
-
-                log.info(
-                    "[%s] Starting FFmpeg (%s)",
-                    slug,
-                    mode,
-                )
-
-                convert(
-                    source=source,
-                    slug=slug,
-                    clean=True,
-                    resume=False,
-                    mode=mode,
-                )
-
-                _upload_hls_directory(slug)
-
-                log.info(
-                    "[%s] Conversion and B2 upload complete",
-                    slug,
-                )
-
-            local_output = STREAMS_DIR / slug
-
-            if local_output.exists():
-                shutil.rmtree(local_output)
-
-            _set_status(slug, "ready")
-
-        except Exception as exc:
-            log.exception("[%s] Conversion failed", slug)
-
-            local_output = STREAMS_DIR / slug
-
-            if local_output.exists():
-                shutil.rmtree(
-                    local_output,
-                    ignore_errors=True,
-                )
-
-            _set_status(
-                slug,
-                "error",
-                error=str(exc),
-            )
-
-
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="HLS Streaming Server",
-    version="3.1.1",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=[
-        "GET",
-        "HEAD",
-        "POST",
-        "DELETE",
-        "OPTIONS",
-    ],
-    allow_headers=["*"],
-)
-
-app.mount(
-    "/static",
-    StaticFiles(
-        directory=str(PUBLIC_DIR),
-        check_dir=False,
-    ),
-    name="static",
-)
-
-
-# ---------------------------------------------------------------------------
-# Private B2 HLS streaming
-# ---------------------------------------------------------------------------
-
-def _stream_url(slug: str, object_path: str) -> str:
-    return (
-        f"/api/stream/{quote(slug, safe='')}/"
-        f"{quote(object_path, safe='/')}"
-    )
-
-
-@app.get("/api/stream/{slug}/{object_path:path}")
-def stream_hls_file(
-    slug: str,
-    object_path: str,
-):
-    """
-    Proxy private B2 HLS playlists and segments.
-
-    The browser accesses this FastAPI server instead of B2.
-    """
-
-    # Restrict slug to a single safe path component.
-    if (
-        not slug
-        or slug in (".", "..")
-        or "/" in slug
-        or "\\" in slug
-    ):
-        raise HTTPException(400, "Invalid video slug")
-
-    object_path = object_path.lstrip("/")
-    parts = object_path.split("/")
-
-    if (
-        not object_path
-        or "\\" in object_path
-        or any(part in ("", ".", "..") for part in parts)
-    ):
-        raise HTTPException(400, "Invalid stream path")
-
-    extension = Path(object_path).suffix.lower()
-
-    if extension not in (".m3u8", ".ts"):
-        raise HTTPException(
-            400,
-            "Unsupported stream file",
-        )
-
-    object_key = f"{slug}/{object_path}"
-
-    try:
-        result = b2_storage.get_object(
-            b2_storage.streams_bucket(),
-            object_key,
-        )
-
-        body = result["Body"]
-
-        # ---------------------------------------------------
-        # Playlist handling
-        # ---------------------------------------------------
-
-        if extension == ".m3u8":
-            try:
-                content = body.read().decode("utf-8")
-            finally:
-                body.close()
-
-            playlist_dir = posixpath.dirname(object_path)
-            rewritten_lines = []
-
-            for line in content.splitlines():
-                stripped = line.strip()
-
-                if (
-                    not stripped
-                    or stripped.startswith("#")
-                ):
-                    rewritten_lines.append(line)
-                    continue
-
-                # HLS playlist entries should be relative paths.
-                if (
-                    stripped.startswith("/")
-                    or "://" in stripped
-                    or "\\" in stripped
-                ):
-                    raise HTTPException(
-                        400,
-                        "Unsupported playlist reference",
-                    )
-
-                resolved_path = posixpath.normpath(
-                    posixpath.join(
-                        playlist_dir,
-                        stripped,
-                    )
-                )
-
-                if (
-                    resolved_path.startswith("../")
-                    or resolved_path == ".."
-                    or resolved_path.startswith("/")
-                ):
-                    raise HTTPException(
-                        400,
-                        "Invalid playlist reference",
-                    )
-
-                rewritten_lines.append(
-                    _stream_url(slug, resolved_path)
-                )
-
-            return Response(
-                content="\n".join(rewritten_lines) + "\n",
-                media_type="application/vnd.apple.mpegurl",
-                headers={
-                    "Cache-Control": "no-store",
-                    "X-Content-Type-Options": "nosniff",
-                },
-            )
-
-        # ---------------------------------------------------
-        # TS segment handling
-        # ---------------------------------------------------
-
-        def file_iterator():
-            try:
-                yield from body.iter_chunks(
-                    chunk_size=1024 * 1024
-                )
-            finally:
-                body.close()
-
-        headers = {
-            "Cache-Control": (
-                "public, max-age=31536000, immutable"
-            ),
-            "X-Content-Type-Options": "nosniff",
-        }
-
-        if result.get("ContentLength") is not None:
-            headers["Content-Length"] = str(
-                result["ContentLength"]
-            )
-
-        return StreamingResponse(
-            file_iterator(),
-            media_type="video/mp2t",
-            headers=headers,
-        )
-
-    except HTTPException:
-        raise
-
+        imported = _sync_existing_originals()
+        log.info("HLS API v5.0 started; %d video(s) registered (%d imported)", len(repository.list_videos()), imported)
     except Exception:
-        log.exception(
-            "B2 streaming failed for object: %s",
-            object_key,
-        )
-
-        raise HTTPException(
-            502,
-            "Unable to retrieve video from storage",
-        )
+        log.exception("S3 startup synchronization failed")
+        raise
+    yield
 
 
-# ---------------------------------------------------------------------------
-# HLS headers
-# ---------------------------------------------------------------------------
+app = FastAPI(title="HLS Streaming Server", version="5.0.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(PUBLIC_DIR), check_dir=False), name="static")
+
+
+def _validate_slug(slug: str) -> str:
+    if not SLUG_RE.fullmatch(slug) or slug in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Invalid video slug")
+    return slug
+
+
+def _safe_filename(name: str | None) -> str:
+    raw = (name or "upload.mp4").replace("\\", "/").split("/")[-1].strip().replace("\x00", "")
+    return raw or "upload.mp4"
+
+
+def _worker_authorized(request: Request) -> None:
+    expected = os.getenv("WORKER_SHARED_TOKEN", "")
+    supplied = request.headers.get("x-worker-token", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="Worker authentication is not configured")
+    if not supplied or not hmac.compare_digest(expected, supplied):
+        raise HTTPException(status_code=401, detail="Invalid worker token")
+
+
+def _app_auth_enabled() -> bool:
+    return bool(os.getenv("APP_USERNAME") and os.getenv("APP_PASSWORD"))
+
 
 @app.middleware("http")
-async def hls_headers(request: Request, call_next):
-    response = await call_next(request)
-
+async def optional_basic_auth(request: Request, call_next):
     path = request.url.path
+    if _app_auth_enabled() and path != "/health" and not path.startswith("/api/worker/"):
+        auth = request.headers.get("authorization", "")
+        valid = False
+        if auth.startswith("Basic "):
+            try:
+                username, password = b64decode(auth.split(" ", 1)[1]).decode("utf-8").split(":", 1)
+                valid = hmac.compare_digest(username, os.environ["APP_USERNAME"]) and hmac.compare_digest(password, os.environ["APP_PASSWORD"])
+            except (ValueError, UnicodeDecodeError):
+                pass
+        if not valid:
+            return JSONResponse({"detail": "Authentication required"}, status_code=401, headers={"WWW-Authenticate": 'Basic realm="HLS Streaming"'})
+    return await call_next(request)
 
+
+@app.middleware("http")
+async def response_headers(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/api/") or path.endswith(".m3u8"):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
     if path.endswith(".m3u8"):
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["Content-Type"] = (
-            "application/vnd.apple.mpegurl"
-        )
-
+        response.headers["Content-Type"] = "application/vnd.apple.mpegurl"
     elif path.endswith(".ts"):
         response.headers["Content-Type"] = "video/mp2t"
-
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
     return response
 
 
-# ---------------------------------------------------------------------------
-# Basic routes
-# ---------------------------------------------------------------------------
+def _master_details(object_key: str) -> list[str] | None:
+    try:
+        result = s3_storage.get_object(s3_storage.streams_bucket(), object_key)
+        try:
+            body = result["Body"].read().decode("utf-8", errors="replace")
+        finally:
+            result["Body"].close()
+        qualities = re.findall(r'NAME="([^\"]+)"', body)
+        return qualities or None
+    except Exception as exc:
+        log.debug("No master playlist at %s: %s", object_key, exc)
+        return None
+
+
+def _discover_existing_stream(slug: str) -> tuple[str, list[str]] | None:
+    legacy = _master_details(f"{slug}/master.m3u8")
+    if legacy:
+        return "", legacy
+    candidates = [item for item in s3_storage.list_files(s3_storage.streams_bucket(), prefix=f"{slug}/jobs/") if str(item.get("Key", "")).endswith("/master.m3u8")]
+    candidates.sort(key=lambda item: str(item.get("LastModified") or ""), reverse=True)
+    for item in candidates:
+        key = str(item["Key"])
+        qualities = _master_details(key)
+        if qualities:
+            prefix = key[len(slug) + 1:-len("/master.m3u8")]
+            return prefix, qualities
+    return None
+
+
+def _sync_existing_originals() -> int:
+    records = s3_storage.list_files(s3_storage.originals_bucket(), prefix="videos/")
+    imported = 0
+    for item in records:
+        key = str(item.get("Key", ""))
+        parts = key.split("/", 2)
+        if len(parts) != 3 or parts[0] != "videos" or not parts[2] or key.endswith("/"):
+            continue
+        slug, relative_filename = parts[1], parts[2]
+        if not SLUG_RE.fullmatch(slug):
+            continue
+        filename = Path(relative_filename).name
+        if repository.import_legacy_video(slug, filename, key, int(item.get("Size", 0))):
+            imported += 1
+            existing = _discover_existing_stream(slug)
+            if existing:
+                prefix, qualities = existing
+                repository.set_legacy_streams(slug, qualities, prefix)
+                log.info("Recovered HLS output for %s: %s", slug, prefix or "legacy root")
+    return imported
+
+
+def _stream_url(slug: str, object_path: str = "master.m3u8") -> str:
+    return f"/api/stream/{quote(slug, safe='')}/{quote(object_path.lstrip('/'), safe='/')}"
+
+
+def _ai_targets_for_video(video: dict, scale: int = 2) -> list[str]:
+    width, height = video.get("source_width"), video.get("source_height")
+    if not width or not height:
+        return []
+    try:
+        return ai_upscale_targets(int(width), int(height), scale)
+    except (TypeError, ValueError):
+        return []
+
+
+def _video_payload(video: dict) -> dict:
+    job = video.get("latest_job") or None
+    job_status = job.get("status") if job else None
+    qualities = sort_qualities(list(video.get("qualities") or []))
+    has_streams = bool(video.get("has_streams") and qualities)
+    source_width = video.get("source_width")
+    source_height = video.get("source_height")
+    native_required = [item["name"] for item in build_quality_ladder(int(source_width), int(source_height))] if source_width and source_height else []
+    native_complete = bool(native_required) and set(native_required).issubset(set(qualities))
+    if job_status in {"queued", "processing"}:
+        status = job_status
+    elif native_complete or (job_status == "ready" and has_streams):
+        status = "ready"
+    elif job_status == "failed":
+        status = "failed"
+    elif has_streams:
+        status = "ready"
+    else:
+        status = "original_only"
+    ai_targets_by_scale = {
+        str(scale): [quality for quality in _ai_targets_for_video(video, scale) if quality not in qualities]
+        for scale in (2, 3, 4)
+    }
+    ai_targets = ai_targets_by_scale["2"]
+    available_ai_targets = any(ai_targets_by_scale.values())
+    return {
+        "slug": video["slug"],
+        "filename": video["filename"],
+        "title": Path(video["filename"]).stem,
+        "size": int(video.get("size_bytes", 0)),
+        "has_source": bool(video.get("original_key")),
+        "original_url": f"/api/original/{quote(video['slug'], safe='')}",
+        "has_streams": has_streams,
+        "can_play": bool(video.get("original_key")),
+        "status": status,
+        "qualities": qualities,
+        "manifest_url": _stream_url(video["slug"], "master.m3u8") if has_streams else None,
+        "source_width": source_width,
+        "source_height": source_height,
+        "source_quality": f"{min(int(source_width), int(source_height))}p" if source_width and source_height else None,
+        "native_qualities": native_required,
+        "native_complete": native_complete,
+        "highest_hls_quality": qualities[-1] if qualities else None,
+        "ai_upscale_available": bool(available_ai_targets),
+        "ai_upscale_targets": ai_targets,
+        "ai_upscale_targets_by_scale": ai_targets_by_scale,
+        "job_id": job.get("id") if job else None,
+        "job_status": job_status,
+        "job_type": job.get("job_type") if job else None,
+        "job_options": job.get("options", {}) if job else {},
+        "job_error": job.get("error") if job else None,
+        "updated_at": video.get("updated_at"),
+    }
+
 
 @app.get("/", include_in_schema=False)
 async def index():
-    file_path = PUBLIC_DIR / "index.html"
-
-    if not file_path.exists():
-        raise HTTPException(
-            500,
-            "index.html not found",
-        )
-
-    return FileResponse(str(file_path))
+    page = PUBLIC_DIR / "index.html"
+    if not page.is_file():
+        raise HTTPException(status_code=500, detail="public/index.html is missing")
+    return FileResponse(page)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "5.0.0", "metadata_store": "s3"}
 
-
-# ---------------------------------------------------------------------------
-# Video library
-# ---------------------------------------------------------------------------
 
 @app.get("/api/videos")
 async def list_videos():
-    try:
-        originals = _list_original_videos()
+    return {"videos": [_video_payload(video) for video in repository.list_videos()]}
 
-        streams = b2_storage.list_files(
-            b2_storage.streams_bucket()
-        )
-
-        stream_slugs = set()
-
-        for item in streams:
-            key = item["Key"]
-
-            if "/" in key:
-                stream_slugs.add(key.split("/", 1)[0])
-
-        videos_by_slug = {}
-
-        for video in originals:
-            videos_by_slug[video["slug"]] = {
-                **video,
-                "has_source": True,
-            }
-
-        for slug in stream_slugs:
-            if slug not in videos_by_slug:
-                videos_by_slug[slug] = {
-                    "slug": slug,
-                    "filename": None,
-                    "title": slug.replace("-", " ").title(),
-                    "has_source": False,
-                    "size": None,
-                }
-
-        videos = []
-
-        for slug, video in videos_by_slug.items():
-            status = _get_status(slug)
-
-            videos.append({
-                **video,
-                "status": status["status"],
-                "qualities": status["qualities"],
-                "manifest_url": (
-                    _stream_url(slug, "master.m3u8")
-                    if status["status"] == "ready"
-                    else None
-                ),
-            })
-
-        videos.sort(
-            key=lambda item: item["title"].lower()
-        )
-
-        return JSONResponse({"videos": videos})
-
-    except Exception as exc:
-        log.exception("Video listing failed")
-
-        raise HTTPException(
-            500,
-            str(exc),
-        )
-
-
-# ---------------------------------------------------------------------------
-# Stream information
-# ---------------------------------------------------------------------------
 
 @app.get("/api/stream-info/{slug}")
 async def stream_info(slug: str):
-    status = _get_status(slug)
-
-    manifest_url = None
-
-    if status["status"] == "ready":
-        manifest_url = _stream_url(
-            slug,
-            "master.m3u8",
-        )
-
-    return JSONResponse({
-        "slug": slug,
-        "manifest_url": manifest_url,
-        "qualities": status["qualities"],
-        "streams_ready": status["status"] == "ready",
-        "status": status["status"],
-    })
+    _validate_slug(slug)
+    video = repository.get_video(slug)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return _video_payload(video)
 
 
-# ---------------------------------------------------------------------------
-# Upload video
-# ---------------------------------------------------------------------------
+@app.get("/api/original/{slug}")
+def stream_original(slug: str, request: Request):
+    """Proxy the original from S3, including byte-range support for seeking."""
+    _validate_slug(slug)
+    video = repository.get_video(slug)
+    if not video or not video.get("original_key"):
+        raise HTTPException(status_code=404, detail="Original video not found")
+    filename = str(video.get("filename") or "video.mp4")
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    byte_range = request.headers.get("range")
+    try:
+        result = s3_storage.get_object(s3_storage.originals_bucket(), str(video["original_key"]), byte_range=byte_range)
+        body = result["Body"]
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=60",
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename, safe='')}"
+        }
+        if result.get("ContentLength") is not None:
+            headers["Content-Length"] = str(result["ContentLength"])
+        status_code = 200
+        if result.get("ContentRange"):
+            headers["Content-Range"] = result["ContentRange"]
+            status_code = 206
+        def original_chunks():
+            try:
+                yield from body.iter_chunks(chunk_size=1024 * 1024)
+            finally:
+                body.close()
+        return StreamingResponse(original_chunks(), status_code=status_code, media_type=content_type, headers=headers)
+    except Exception as exc:
+        log.exception("Could not stream original object for %s", slug)
+        raise HTTPException(status_code=502, detail="Unable to retrieve original video from storage") from exc
+
+
+@app.get("/api/stream/{slug}/{object_path:path}")
+def stream_hls_file(slug: str, object_path: str):
+    _validate_slug(slug)
+    object_path = object_path.lstrip("/")
+    parts = object_path.split("/")
+    if not object_path or "\\" in object_path or any(part in {"", ".", ".."} for part in parts) or Path(object_path).suffix.lower() not in {".m3u8", ".ts"}:
+        raise HTTPException(status_code=400, detail="Invalid HLS path")
+    video = repository.get_video(slug)
+    if not video or not video.get("has_streams"):
+        raise HTTPException(status_code=404, detail="HLS stream not found")
+
+    quality_prefixes = video.get("quality_prefixes") or {}
+    if object_path == "master.m3u8":
+        storage_prefix = str(video.get("stream_prefix") or "").strip("/")
+    else:
+        quality = parts[0]
+        if not QUALITY_RE.fullmatch(quality):
+            raise HTTPException(status_code=404, detail="Unknown rendition")
+        storage_prefix = str(quality_prefixes.get(quality) or "").strip("/")
+        # Legacy records without per-quality map used one shared stream prefix.
+        if not storage_prefix and quality in (video.get("qualities") or []):
+            storage_prefix = str(video.get("stream_prefix") or "").strip("/")
+        if not storage_prefix:
+            raise HTTPException(status_code=404, detail="Rendition is not available")
+    object_key = f"{slug}/{storage_prefix + '/' if storage_prefix else ''}{object_path}"
+    extension = Path(object_path).suffix.lower()
+    try:
+        result = s3_storage.get_object(s3_storage.streams_bucket(), object_key)
+        body = result["Body"]
+        if extension == ".m3u8":
+            try:
+                playlist = body.read().decode("utf-8")
+            finally:
+                body.close()
+            playlist_dir = posixpath.dirname(object_path)
+            rewritten: list[str] = []
+            for line in playlist.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    rewritten.append(line)
+                    continue
+                if stripped.startswith("/") or "://" in stripped or "\\" in stripped:
+                    raise HTTPException(status_code=400, detail="Unsupported HLS playlist reference")
+                resolved = posixpath.normpath(posixpath.join(playlist_dir, stripped))
+                if resolved == ".." or resolved.startswith("../") or resolved.startswith("/"):
+                    raise HTTPException(status_code=400, detail="Invalid HLS playlist reference")
+                rewritten.append(_stream_url(slug, resolved))
+            return Response(content="\n".join(rewritten) + "\n", media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+        headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+        if result.get("ContentLength") is not None:
+            headers["Content-Length"] = str(result["ContentLength"])
+        def segment_chunks():
+            try:
+                yield from body.iter_chunks(chunk_size=1024 * 1024)
+            finally:
+                body.close()
+        return StreamingResponse(segment_chunks(), media_type="video/mp2t", headers=headers)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Failed to proxy S3 object %s", object_key)
+        raise HTTPException(status_code=502, detail="Unable to retrieve HLS object from storage") from exc
+
 
 @app.post("/api/upload")
 async def upload_video(file: UploadFile = File(...)):
-    filename = Path(
-        file.filename or "upload.mp4"
-    ).name
-
+    filename = _safe_filename(file.filename)
+    from app.ffmpeg_service import VIDEO_EXTENSIONS, slugify
     extension = Path(filename).suffix.lower()
-
     if extension not in VIDEO_EXTENSIONS:
-        raise HTTPException(
-            400,
-            (
-                f"Unsupported file type '{extension}'. "
-                f"Allowed: {', '.join(VIDEO_EXTENSIONS)}"
-            ),
-        )
-
-    slug = slugify(filename)
-
-    if _find_original(slug):
-        raise HTTPException(
-            409,
-            f"A video with slug '{slug}' already exists.",
-        )
-
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '{extension}'. Allowed: {', '.join(VIDEO_EXTENSIONS)}")
+    slug = _validate_slug(slugify(filename))
+    if repository.get_video(slug):
+        raise HTTPException(status_code=409, detail=f"A video with slug '{slug}' already exists")
+    max_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024**3)))
     object_key = f"videos/{slug}/{filename}"
-
-    log.info("Receiving upload: %s", filename)
-
     try:
-        with tempfile.TemporaryDirectory(
-            prefix="hls-upload-"
-        ) as temp_dir:
-
-            local_file = Path(temp_dir) / filename
-            size = 0
-
-            with local_file.open("wb") as output:
-                while True:
-                    chunk = await file.read(
-                        1024 * 1024
-                    )
-
-                    if not chunk:
-                        break
-
-                    output.write(chunk)
-                    size += len(chunk)
-
-            if size == 0:
-                raise HTTPException(
-                    400,
-                    "Uploaded file is empty.",
-                )
-
-            log.info(
-                (
-                    "Uploading original to private B2 bucket: "
-                    "%s (%.1f MB)"
-                ),
-                filename,
-                size / 1_048_576,
-            )
-
-            b2_storage.upload_file(
-                local_file,
-                b2_storage.originals_bucket(),
-                object_key,
-            )
-
-        await file.close()
-
+        file.file.seek(0, 2)
+        size = int(file.file.tell())
+        file.file.seek(0)
+        if size <= 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        if max_bytes > 0 and size > max_bytes:
+            raise HTTPException(status_code=413, detail=f"Upload exceeds {max_bytes} bytes")
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        s3_storage.upload_fileobj(file.file, s3_storage.originals_bucket(), object_key, content_type=content_type)
+        repository.upsert_video(slug, filename, object_key, size)
     except HTTPException:
         raise
-
     except Exception as exc:
-        log.exception("Original upload failed")
+        log.exception("Original upload or metadata save failed")
+        raise HTTPException(status_code=502, detail="Could not store original video and metadata in S3") from exc
+    finally:
+        await file.close()
+    return JSONResponse({"slug": slug, "filename": filename, "status": "original_only", "original_url": f"/api/original/{slug}", "message": "Original uploaded and is playable. Request standard HLS processing when ready."}, status_code=201)
 
-        raise HTTPException(
-            500,
-            f"Upload to B2 failed: {exc}",
-        )
-
-    _set_status(slug, "pending")
-
-    thread = threading.Thread(
-        target=_run_conversion,
-        args=(slug, object_key, "cpu"),
-        daemon=True,
-        name=f"convert-{slug}",
-    )
-
-    thread.start()
-
-    return JSONResponse(
-        {
-            "slug": slug,
-            "filename": filename,
-            "status": "converting",
-            "message": (
-                "Original uploaded to B2. "
-                "HLS conversion started."
-            ),
-        },
-        status_code=202,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Manual conversion
-# ---------------------------------------------------------------------------
 
 @app.post("/api/convert/{slug}")
-async def trigger_convert(
-    slug: str,
-    mode: str = "cpu",
-):
-    if mode not in ("cpu", "auto"):
-        raise HTTPException(
-            400,
-            "Render supports cpu mode. Allowed: cpu, auto.",
-        )
+async def request_conversion(slug: str, mode: str = "auto", job_type: str = "hls", scale: int = 2, tile: int | None = None):
+    _validate_slug(slug)
+    if mode not in ALLOWED_MODES:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(ALLOWED_MODES)}")
+    if job_type not in {"hls", "ai_upscale"}:
+        raise HTTPException(status_code=400, detail="job_type must be 'hls' or 'ai_upscale'")
+    if scale not in {2, 3, 4}:
+        raise HTTPException(status_code=400, detail="AI scale must be 2, 3, or 4")
+    if tile is not None and tile != 0 and not 32 <= tile <= 2048:
+        raise HTTPException(status_code=400, detail="AI tile must be 0 (auto) or between 32 and 2048")
+    video = repository.get_video(slug)
+    if not video:
+        raise HTTPException(status_code=404, detail="Original video not found")
 
-    original = _find_original(slug)
+    options: dict = {}
+    if job_type == "hls":
+        if video.get("has_streams") and video.get("qualities") and not (video.get("source_width") and video.get("source_height")):
+            return JSONResponse({"slug": slug, "status": "ready", "qualities": video["qualities"], "already_ready": True, "message": "Existing HLS renditions are already registered; no duplicate job was created."}, status_code=200)
+        if video.get("source_width") and video.get("source_height"):
+            required = [item["name"] for item in build_quality_ladder(int(video["source_width"]), int(video["source_height"]))]
+            if not required:
+                raise HTTPException(status_code=422, detail="Source is below the lowest configured 240p HLS rendition. The original remains playable without upscaling.")
+            missing = [quality for quality in required if quality not in (video.get("qualities") or [])]
+            if not missing:
+                return JSONResponse({"slug": slug, "status": "ready", "qualities": video["qualities"], "already_ready": True, "message": "All native-quality HLS renditions are already available; no duplicate job was created."}, status_code=200)
+            options = {"target_qualities": missing}
+        else:
+            options = {}
+    else:
+        if not video.get("source_width") or not video.get("source_height"):
+            raise HTTPException(status_code=409, detail="Run standard HLS processing once first. The worker will inspect the source resolution; AI options appear after that.")
+        source_edge = min(int(video["source_width"]), int(video["source_height"]))
+        if source_edge > 720:
+            raise HTTPException(status_code=409, detail=f"AI upscaling is not offered for this source ({source_edge}p). Its native resolution is already above 720p.")
+        targets = ai_upscale_targets(int(video["source_width"]), int(video["source_height"]), scale)
+        missing_targets = [quality for quality in targets if quality not in (video.get("qualities") or [])]
+        if not missing_targets:
+            return JSONResponse({"slug": slug, "status": "ready", "qualities": video.get("qualities") or [], "already_ready": True, "message": "All configured AI-upscaled target qualities are already available."}, status_code=200)
+        try:
+            effective_tile = tile if tile is not None else int(os.getenv("AI_TILE_SIZE", "384"))
+            ai_strength = float(os.getenv("AI_STRENGTH", "0.45"))
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail="AI_TILE_SIZE and AI_STRENGTH must be numeric") from exc
+        if effective_tile != 0 and not 32 <= effective_tile <= 2048:
+            raise HTTPException(status_code=500, detail="AI_TILE_SIZE must be 0 or between 32 and 2048")
+        if not 0.0 <= ai_strength <= 1.0:
+            raise HTTPException(status_code=500, detail="AI_STRENGTH must be between 0 and 1")
+        model = os.getenv("AI_MODEL_NAME", "realesr-animevideov3")
+        allowed_models = {"realesr-animevideov3", "realesrgan-x4plus", "realesrnet-x4plus", "realesrgan-x4plus-anime-6B"}
+        if model not in allowed_models:
+            raise HTTPException(status_code=500, detail=f"AI_MODEL_NAME must be one of {sorted(allowed_models)}")
+        required_device = os.getenv("AI_REQUIRED_DEVICE", "auto").lower()
+        if required_device not in {"auto", "cpu", "cuda"}:
+            raise HTTPException(status_code=500, detail="AI_REQUIRED_DEVICE must be auto, cpu or cuda")
+        profile = os.getenv("AI_PROFILE", "none")
+        if profile not in {"none", "minimal", "soft_camera", "old_tv", "heavy_noise"}:
+            raise HTTPException(status_code=500, detail="AI_PROFILE is not supported")
+        options = {
+            "scale": scale, "tile": effective_tile, "model": model,
+            "device": required_device, "ai_strength": ai_strength,
+            "profile": profile,
+            "interpolate": os.getenv("AI_INTERPOLATE", "false").lower() in {"1", "true", "yes", "on"},
+            "target_qualities": missing_targets,
+        }
 
-    if original is None:
-        raise HTTPException(
-            404,
-            f"No original video found for slug '{slug}'",
-        )
+    job = repository.create_job(slug, mode=mode, job_type=job_type, options=options)
+    if not job:
+        active = repository.active_job_for_slug(slug)
+        detail = f"A {active.get('job_type')} job is already {active.get('status')} for this video." if active else "A matching job could not be created."
+        raise HTTPException(status_code=409, detail=detail)
+    return JSONResponse({"slug": slug, "job_id": job["id"], "job_type": job["job_type"], "options": job.get("options", {}), "status": job["status"], "message": "Processing job queued. Available qualities will appear progressively."}, status_code=202)
 
-    current = _get_status(slug)
-
-    if current["status"] == "converting":
-        return JSONResponse({
-            "slug": slug,
-            "status": "converting",
-            "message": "Already converting.",
-        })
-
-    _set_status(slug, "pending")
-
-    thread = threading.Thread(
-        target=_run_conversion,
-        args=(slug, original["Key"], mode),
-        daemon=True,
-        name=f"convert-{slug}",
-    )
-
-    thread.start()
-
-    return JSONResponse(
-        {
-            "slug": slug,
-            "status": "converting",
-            "message": "Conversion started.",
-        },
-        status_code=202,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Conversion status
-# ---------------------------------------------------------------------------
 
 @app.get("/api/convert/{slug}/status")
 async def conversion_status(slug: str):
-    status = _get_status(slug)
+    _validate_slug(slug)
+    video = repository.get_video(slug)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return _video_payload(video)
 
-    manifest_url = None
-
-    if status["status"] == "ready":
-        manifest_url = _stream_url(
-            slug,
-            "master.m3u8",
-        )
-
-    return JSONResponse({
-        "slug": slug,
-        "status": status["status"],
-        "qualities": status["qualities"],
-        "error": status["error"],
-        "manifest_url": manifest_url,
-    })
-
-
-# ---------------------------------------------------------------------------
-# Delete video
-# ---------------------------------------------------------------------------
 
 @app.delete("/api/videos/{slug}")
-async def delete_video(
-    slug: str,
-    delete_source: bool = False,
-):
+async def delete_video(slug: str, delete_source: bool = False):
+    _validate_slug(slug)
+    video = repository.get_video(slug)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if repository.active_job_for_slug(slug):
+        raise HTTPException(status_code=409, detail="Cannot delete a video while a worker is processing it")
     try:
-        b2_storage.delete_prefix(
-            b2_storage.streams_bucket(),
-            f"{slug}/",
-        )
-
+        s3_storage.delete_prefix(s3_storage.streams_bucket(), f"{slug}/")
         if delete_source:
-            b2_storage.delete_prefix(
-                b2_storage.originals_bucket(),
-                _original_prefix(slug),
-            )
-
-        with _status_lock:
-            _conversion_status.pop(slug, None)
-
-        return JSONResponse({
-            "slug": slug,
-            "deleted": True,
-            "source_deleted": delete_source,
-        })
-
+            s3_storage.delete_prefix(s3_storage.originals_bucket(), f"videos/{slug}/")
+            repository.remove_video(slug)
+        else:
+            repository.clear_streams(slug)
     except Exception as exc:
-        log.exception("Delete failed for %s", slug)
-
-        raise HTTPException(
-            500,
-            str(exc),
-        )
+        log.exception("Could not delete video %s", slug)
+        raise HTTPException(status_code=502, detail="Could not delete video objects/metadata from S3") from exc
+    return {"slug": slug, "deleted_streams": True, "source_deleted": delete_source}
 
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
-
-@app.on_event("startup")
-async def startup_banner():
+# Authenticated worker API: S3 credentials are never exposed to the browser.
+@app.post("/api/worker/jobs/claim")
+async def worker_claim(request: Request):
+    _worker_authorized(request)
     try:
-        originals = _list_original_videos()
-
-        log.info("=" * 55)
-        log.info("  HLS Streaming Server v3.1.1 - Backblaze B2")
-        log.info(
-            "  Original bucket : %s",
-            b2_storage.originals_bucket(),
-        )
-        log.info(
-            "  Streams bucket  : %s",
-            b2_storage.streams_bucket(),
-        )
-        log.info(
-            "  Originals       : %d",
-            len(originals),
-        )
-        log.info("  Storage         : Private Backblaze B2")
-        log.info("  Playback        : FastAPI HLS proxy")
-        log.info("=" * 55)
-
+        payload = await request.json()
     except Exception:
-        log.exception("B2 startup check failed")
-        raise
+        payload = {}
+    capabilities = payload.get("capabilities", ["cpu"]) if isinstance(payload, dict) else ["cpu"]
+    if not isinstance(capabilities, list):
+        raise HTTPException(status_code=400, detail="capabilities must be an array")
+    capabilities = [str(value).lower() for value in capabilities if str(value).lower() in {"cpu", "gpu"}]
+    if not capabilities:
+        capabilities = ["cpu"]
+    stale_minutes = int(os.getenv("WORKER_JOB_STALE_MINUTES", "60"))
+    job = repository.claim_next_job(stale_minutes=max(10, stale_minutes), capabilities=capabilities)
+    return {"job": job}
+
+
+@app.post("/api/worker/jobs/{job_id}/heartbeat")
+async def worker_heartbeat(job_id: str, request: Request):
+    _worker_authorized(request)
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    stale_minutes = int(os.getenv("WORKER_JOB_STALE_MINUTES", "60"))
+    job = repository.heartbeat_job(job_id, stale_minutes)
+    if not job:
+        raise HTTPException(status_code=409, detail="Job is no longer processing")
+    return {"job_id": job_id, "status": "processing"}
+
+
+@app.post("/api/worker/jobs/{job_id}/quality-ready")
+async def worker_quality_ready(job_id: str, request: Request):
+    """Publish a finished rendition in the catalog without waiting for other rungs."""
+    _worker_authorized(request)
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    job = repository.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "processing":
+        raise HTTPException(status_code=409, detail="Job is not currently processing")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    quality = payload.get("quality") if isinstance(payload, dict) else None
+    qualities = payload.get("qualities", []) if isinstance(payload, dict) else []
+    try:
+        width, height = int(payload["source_width"]), int(payload["source_height"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="source_width and source_height are required integers")
+    if not isinstance(quality, str) or not QUALITY_RE.fullmatch(quality):
+        raise HTTPException(status_code=400, detail="Invalid quality label")
+    if not isinstance(qualities, list) or not all(isinstance(value, str) and QUALITY_RE.fullmatch(value) for value in qualities):
+        raise HTTPException(status_code=400, detail="qualities must be an array of valid quality labels")
+    slug = str(job["slug"])
+    job_prefix = f"{slug}/jobs/{job_id}"
+    bucket = s3_storage.streams_bucket()
+    if not s3_storage.object_exists(bucket, f"{job_prefix}/{quality}/playlist.m3u8"):
+        raise HTTPException(status_code=409, detail="Rendition playlist was not uploaded")
+    if not s3_storage.object_exists(bucket, f"{job_prefix}/master.m3u8"):
+        raise HTTPException(status_code=409, detail="Progressive master playlist was not uploaded")
+    result = repository.publish_quality(job_id, quality, qualities, width, height)
+    if not result:
+        raise HTTPException(status_code=409, detail="Job is no longer processing")
+    return {"job_id": job_id, "status": "processing", "quality": quality, "qualities": result.get("qualities", [])}
+
+
+@app.post("/api/worker/jobs/{job_id}/complete")
+async def worker_complete(job_id: str, request: Request):
+    _worker_authorized(request)
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    job = repository.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "processing":
+        raise HTTPException(status_code=409, detail="Job is not currently processing")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    qualities = payload.get("qualities", []) if isinstance(payload, dict) else []
+    if not isinstance(qualities, list) or not qualities or not all(isinstance(q, str) and QUALITY_RE.fullmatch(q) for q in qualities):
+        raise HTTPException(status_code=400, detail="Worker must provide a non-empty qualities array")
+    master_key = f"{job['slug']}/jobs/{job_id}/master.m3u8"
+    if not s3_storage.object_exists(s3_storage.streams_bucket(), master_key):
+        raise HTTPException(status_code=409, detail="Uploaded HLS master playlist was not found in S3")
+    result = repository.complete_job(job_id, qualities)
+    if not result:
+        raise HTTPException(status_code=409, detail="Job could not be marked complete")
+    log.info("Worker completed job %s; qualities now available: %s", job_id, qualities)
+    return {"job_id": job_id, "status": "ready", "qualities": result.get("qualities", [])}
+
+
+@app.post("/api/worker/jobs/{job_id}/fail")
+async def worker_fail(job_id: str, request: Request):
+    _worker_authorized(request)
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    error = str(payload.get("error", "Worker reported a failure")) if isinstance(payload, dict) else "Worker reported a failure"
+    result = repository.fail_job(job_id, error)
+    if not result:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job_id": job_id, "status": result["status"]}
 
 
-
-# from __future__ import annotations
-
-# import logging
-# import os
-# import shutil
-# import tempfile
-# import threading
-
-# from pathlib import Path
-# from typing import Any
-
-# from fastapi import (
-#     FastAPI,
-#     HTTPException,
-#     Request,
-#     UploadFile,
-#     File,
-# )
-# from fastapi.responses import FileResponse, JSONResponse
-# from fastapi.staticfiles import StaticFiles
-# from fastapi.middleware.cors import CORSMiddleware
-
-# from app import b2_storage
-# from app.ffmpeg_service import (
-#     STREAMS_DIR,
-#     slugify,
-#     convert,
-#     VIDEO_EXTENSIONS,
-# )
-
-
-# # ---------------------------------------------------------------------------
-# # Logging
-# # ---------------------------------------------------------------------------
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format="%(asctime)s  %(levelname)-8s  %(message)s",
-#     datefmt="%H:%M:%S",
-# )
-# log = logging.getLogger(__name__)
-
-# # ---------------------------------------------------------------------------
-# # Paths
-# # ---------------------------------------------------------------------------
-# PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
-# PUBLIC_DIR:   Path = PROJECT_ROOT / "public"
-
-# # ---------------------------------------------------------------------------
-# # In-memory conversion status store
-# # slug → { status, error, qualities }
-# # status: "pending" | "converting" | "ready" | "error"
-# # ---------------------------------------------------------------------------
-# _conversion_status: dict[str, dict[str, Any]] = {}
-# _status_lock = threading.Lock()
-
-
-# def _get_status(slug: str) -> dict[str, Any]:
-#     with _status_lock:
-#         if slug not in _conversion_status:
-#             # Derive initial status from disk
-#             if streams_ready(slug):
-#                 _conversion_status[slug] = {
-#                     "status": "ready",
-#                     "qualities": available_qualities(slug),
-#                     "error": None,
-#                 }
-#             else:
-#                 _conversion_status[slug] = {"status": "pending", "qualities": [], "error": None}
-#         return dict(_conversion_status[slug])
-
-
-# def _set_status(slug: str, status: str, error: str | None = None) -> None:
-#     with _status_lock:
-#         _conversion_status[slug] = {
-#             "status": status,
-#             "qualities": available_qualities(slug) if status == "ready" else [],
-#             "error": error,
-#         }
-
-
-# # ---------------------------------------------------------------------------
-# # App
-# # ---------------------------------------------------------------------------
-# app = FastAPI(title="HLS Streaming Server", version="2.0.0")
-
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
-#     allow_headers=["*"],
-# )
-
-# # ---------------------------------------------------------------------------
-# # Static mounts — must come before routes that catch-all
-# # ---------------------------------------------------------------------------
-# STREAMS_DIR.mkdir(parents=True, exist_ok=True)
-# VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
-# PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
-
-# app.mount("/streams", StaticFiles(directory=str(STREAMS_DIR), check_dir=False), name="streams")
-# app.mount("/static",  StaticFiles(directory=str(PUBLIC_DIR),  check_dir=False), name="static")
-
-
-# # ---------------------------------------------------------------------------
-# # HLS MIME + no-cache middleware
-# # ---------------------------------------------------------------------------
-# @app.middleware("http")
-# async def hls_headers(request: Request, call_next):
-#     response = await call_next(request)
-#     path = request.url.path
-#     if path.endswith(".m3u8"):
-#         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-#         response.headers["Pragma"]        = "no-cache"
-#         response.headers["Expires"]       = "0"
-#         response.headers["Content-Type"]  = "application/vnd.apple.mpegurl"
-#     elif path.endswith(".ts"):
-#         response.headers["Content-Type"]  = "video/mp2t"
-#     return response
-
-
-# # ---------------------------------------------------------------------------
-# # Background conversion worker
-# # ---------------------------------------------------------------------------
-# def _run_conversion(slug: str, source: Path, mode: str = "auto") -> None:
-#     """Called in a background thread. Updates _conversion_status when done."""
-#     _set_status(slug, "converting")
-#     log.info(f"[{slug}] Conversion started (mode={mode})")
-#     try:
-#         convert(source=source, slug=slug, clean=True, resume=False, mode=mode)
-#         _set_status(slug, "ready")
-#         log.info(f"[{slug}] Conversion complete")
-#     except Exception as exc:
-#         _set_status(slug, "error", error=str(exc))
-#         log.error(f"[{slug}] Conversion failed: {exc}")
-
-
-# # ---------------------------------------------------------------------------
-# # Routes
-# # ---------------------------------------------------------------------------
-
-# @app.get("/", include_in_schema=False)
-# async def index() -> FileResponse:
-#     f = PUBLIC_DIR / "index.html"
-#     if not f.exists():
-#         raise HTTPException(500, "index.html not found")
-#     return FileResponse(str(f))
-
-
-# @app.get("/health")
-# async def health() -> JSONResponse:
-#     return JSONResponse({"status": "ok"})
-
-
-# # ── Video library ─────────────────────────────────────────────────────────
-
-# @app.get("/api/videos")
-# async def list_videos() -> JSONResponse:
-#     """
-#     Return all videos in videos/ with their stream status.
-#     Also includes videos that only have streams (source deleted).
-#     """
-#     videos: list[dict] = []
-
-#     # Videos with source files
-#     seen_slugs: set[str] = set()
-#     for video in find_all_videos():
-#         slug   = slugify(video.name)
-#         status = _get_status(slug)
-#         seen_slugs.add(slug)
-#         videos.append({
-#             "slug":       slug,
-#             "filename":   video.name,
-#             "title":      video.stem,
-#             "has_source": True,
-#             "status":     status["status"],
-#             "qualities":  status["qualities"],
-#             "manifest_url": f"/streams/{slug}/master.m3u8" if status["status"] == "ready" else None,
-#         })
-
-#     # Slugs that have streams but source was deleted
-#     from app.ffmpeg_service import STREAMS_DIR as SD
-#     if SD.exists():
-#         for d in sorted(SD.iterdir()):
-#             if d.is_dir() and d.name not in seen_slugs and (d / "master.m3u8").exists():
-#                 slug = d.name
-#                 videos.append({
-#                     "slug":       slug,
-#                     "filename":   None,
-#                     "title":      slug.replace("-", " ").title(),
-#                     "has_source": False,
-#                     "status":     "ready",
-#                     "qualities":  available_qualities(slug),
-#                     "manifest_url": f"/streams/{slug}/master.m3u8",
-#                 })
-
-#     return JSONResponse({"videos": videos})
-
-
-# @app.get("/api/stream-info/{slug}")
-# async def stream_info(slug: str) -> JSONResponse:
-#     status = _get_status(slug)
-#     return JSONResponse({
-#         "slug":         slug,
-#         "manifest_url": f"/streams/{slug}/master.m3u8",
-#         "qualities":    status["qualities"],
-#         "streams_ready": status["status"] == "ready",
-#         "status":       status["status"],
-#     })
-
-
-# # ── Upload ────────────────────────────────────────────────────────────────
-
-# @app.post("/api/upload")
-# async def upload_video(file: UploadFile = File(...)) -> JSONResponse:
-#     """
-#     Accept a video file upload, save it to videos/, and automatically
-#     trigger HLS conversion in a background thread.
-#     """
-#     filename = file.filename or "upload.mp4"
-#     ext      = Path(filename).suffix.lower()
-
-#     from app.ffmpeg_service import VIDEO_EXTENSIONS
-#     if ext not in VIDEO_EXTENSIONS:
-#         raise HTTPException(400, f"Unsupported file type '{ext}'. Allowed: {', '.join(VIDEO_EXTENSIONS)}")
-
-#     dest = VIDEOS_DIR / filename
-#     log.info(f"Receiving upload: {filename}")
-
-#     # Stream the upload to disk in 1 MB chunks to handle large files
-#     try:
-#         with dest.open("wb") as f:
-#             while True:
-#                 chunk = await file.read(1024 * 1024)
-#                 if not chunk:
-#                     break
-#                 f.write(chunk)
-#     except Exception as exc:
-#         dest.unlink(missing_ok=True)
-#         raise HTTPException(500, f"Upload failed: {exc}")
-
-#     log.info(f"Saved {filename} ({dest.stat().st_size / 1_048_576:.1f} MB)")
-
-#     slug = slugify(filename)
-#     _set_status(slug, "pending")
-
-#     # Auto-trigger conversion in a background thread
-#     thread = threading.Thread(
-#         target=_run_conversion,
-#         args=(slug, dest, "auto"),
-#         daemon=True,
-#         name=f"convert-{slug}",
-#     )
-#     thread.start()
-
-#     return JSONResponse({
-#         "slug":     slug,
-#         "filename": filename,
-#         "status":   "converting",
-#         "message":  "Upload complete. Conversion started automatically.",
-#     }, status_code=202)
-
-
-# # ── Conversion control ────────────────────────────────────────────────────
-
-# @app.post("/api/convert/{slug}")
-# async def trigger_convert(slug: str, mode: str = "auto") -> JSONResponse:
-#     """
-#     Manually trigger (or re-trigger) conversion for a slug.
-#     Useful for re-encoding after changing quality settings.
-#     """
-#     source = find_video_by_slug(slug)
-#     if source is None:
-#         raise HTTPException(404, f"No source video found for slug '{slug}'")
-
-#     current = _get_status(slug)
-#     if current["status"] == "converting":
-#         return JSONResponse({"slug": slug, "status": "converting", "message": "Already converting."})
-
-#     _set_status(slug, "pending")
-#     thread = threading.Thread(
-#         target=_run_conversion,
-#         args=(slug, source, mode),
-#         daemon=True,
-#         name=f"convert-{slug}",
-#     )
-#     thread.start()
-
-#     return JSONResponse({"slug": slug, "status": "converting", "message": "Conversion started."}, status_code=202)
-
-
-# @app.get("/api/convert/{slug}/status")
-# async def conversion_status(slug: str) -> JSONResponse:
-#     status = _get_status(slug)
-#     return JSONResponse({
-#         "slug":      slug,
-#         "status":    status["status"],
-#         "qualities": status["qualities"],
-#         "error":     status["error"],
-#         "manifest_url": f"/streams/{slug}/master.m3u8" if status["status"] == "ready" else None,
-#     })
-
-
-# # ── Delete video ──────────────────────────────────────────────────────────
-
-# @app.delete("/api/videos/{slug}")
-# async def delete_video(slug: str, delete_source: bool = False) -> JSONResponse:
-#     """
-#     Delete the HLS streams for a slug.
-#     Optionally also deletes the source file (delete_source=true).
-#     """
-#     import shutil as _shutil
-#     sd = STREAMS_DIR / slug
-#     if sd.exists():
-#         _shutil.rmtree(sd)
-
-#     if delete_source:
-#         source = find_video_by_slug(slug)
-#         if source and source.exists():
-#             source.unlink()
-
-#     with _status_lock:
-#         _conversion_status.pop(slug, None)
-
-#     return JSONResponse({"slug": slug, "deleted": True})
-
-
-# # ---------------------------------------------------------------------------
-# # Startup banner
-# # ---------------------------------------------------------------------------
-
-# @app.on_event("startup")
-# async def startup_banner() -> None:
-#     videos  = find_all_videos()
-#     ready   = [slugify(v.name) for v in videos if streams_ready(slugify(v.name))]
-#     log.info("=" * 55)
-#     log.info("  HLS Streaming Server v2  (multi-video)")
-#     log.info("  Player   : http://localhost:8000")
-#     log.info("  Health   : http://localhost:8000/health")
-#     log.info("  Videos   : http://localhost:8000/api/videos")
-#     log.info(f"  Sources  : {len(videos)} video(s) in videos/")
-#     log.info(f"  Ready    : {len(ready)} stream(s) converted")
-#     if not videos:
-#         log.warning("  Upload a video at http://localhost:8000 to get started")
-#     log.info("=" * 55)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000)

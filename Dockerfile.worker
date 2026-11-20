@@ -1,0 +1,23 @@
+#python-hls-streaming\Dockerfile.worker
+# Separate image for the processing worker. The API image remains lightweight.
+# Compose selects CPU-only or CUDA-enabled PyTorch through TORCH_INDEX_URL.
+# CPU/GPU worker image. Build with matching TORCH_INDEX_URL and TORCH_VERSION.
+FROM python:3.11-slim
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG TORCH_VERSION=2.14.1
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg ca-certificates libgl1 libglib2.0-0 libgomp1 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+RUN python -m pip install --upgrade pip \
+    && python -m pip install --index-url "${TORCH_INDEX_URL}" \
+    --extra-index-url https://pypi.org/simple "torch==${TORCH_VERSION}"
+COPY requirements-worker.txt ./
+RUN python -m pip install -r requirements-worker.txt
+COPY app/ ./app/
+COPY worker.py ./worker.py
+RUN mkdir -p /app/worker_data /app/weights
+CMD ["python", "worker.py"]
+
+

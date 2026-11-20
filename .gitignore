@@ -43,3 +43,4 @@ ngrok.yml
 /app/graphify-out
 /graphify-out
 app/.env
+/worker_data

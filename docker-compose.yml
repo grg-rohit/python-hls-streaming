@@ -1,64 +1,76 @@
-#python-hls-streaming\docker-compose.yml
 services:
-
-  # ── converter (CPU) ───────────────────────────────────────────────────────
-  # Uses libx264. Works everywhere, no GPU required.
-  #
-  # Usage:
-  #   docker compose run --rm converter
-  #   docker compose run --rm converter python convert_video.py --mode cpu
-  #   docker compose run --rm converter python convert_video.py --resume
-  #
-  converter:
-    build: .
-    command: ["python", "convert_video.py", "--mode", "cpu"]
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: app/.env
+    ports:
+      - "8000:8000"
     volumes:
-      - ./videos:/app/videos
-      - ./streams:/app/streams
+      - ./public:/app/public:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
-  # ── converter-gpu (NVENC / hybrid) ───────────────────────────────────────
-  # Passes the Nvidia GPU into the container so FFmpeg can use NVENC.
-  # Requires:
-  #   • NVIDIA Container Toolkit installed on the host
-  #     https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
-  #   • Docker Desktop → Settings → Resources → Enable GPU support
-  #
-  # Usage — GPU only (fastest single-stream):
-  #   docker compose run --rm converter-gpu
-  #
-  # Usage — hybrid (CPU handles 240p/360p + GPU handles 480p+ in parallel):
-  #   docker compose run --rm converter-gpu python convert_video.py --mode hybrid
-  #
-  # Usage — resume after an interrupted conversion:
-  #   docker compose run --rm converter-gpu python convert_video.py --mode hybrid --resume
-  #
-  converter-gpu:
-    build: .
-    command: ["python", "convert_video.py", "--mode", "gpu"]
+  worker-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+        TORCH_VERSION: "2.14.1"
+    image: hls-worker:cpu
+    profiles: ["cpu-worker"]
+    restart: unless-stopped
+    env_file: app/.env
+    environment:
+      API_BASE_URL: http://server:8000
+      WORKER_DEVICE: cpu
+      AI_ENCODER: cpu
+      AI_HALF: "false"
+      WORKER_DATA_DIR: /app/worker_data
+      FRAMELIFT_WEIGHTS: /app/worker_data/framelift_weights
+    command: ["python", "worker.py"]
+    depends_on:
+      server:
+        condition: service_healthy
     volumes:
-      - ./videos:/app/videos
-      - ./streams:/app/streams
+      - ./worker_data:/app/worker_data
+
+  worker-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
+        TORCH_VERSION: "2.14.1"
+    image: hls-worker:gpu
+    profiles: ["gpu"]
+    restart: unless-stopped
+    env_file: app/.env
+    environment:
+      API_BASE_URL: http://server:8000
+      WORKER_DEVICE: cuda
+      AI_ENCODER: nvenc
+      AI_HALF: "true"
+      WORKER_DATA_DIR: /app/worker_data
+      FRAMELIFT_WEIGHTS: /app/worker_data/framelift_weights
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    command: ["python", "worker.py"]
+    depends_on:
+      server:
+        condition: service_healthy
+    volumes:
+      - ./worker_data:/app/worker_data
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: 1
-              capabilities: [video, compute]
-
-  # ── server ────────────────────────────────────────────────────────────────
-  # Serves the HLS player on http://localhost:8000
-  # Run this after conversion is complete.
-  #
-  # Usage:
-  #   docker compose up server
-  #
-  server:
-    build: .
-    command: ["python", "run.py"]
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./videos:/app/videos
-      - ./streams:/app/streams
-      - ./public:/app/public
+              capabilities: [gpu]
