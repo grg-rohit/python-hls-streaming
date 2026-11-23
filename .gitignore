@@ -44,3 +44,6 @@ ngrok.yml
 /graphify-out
 app/.env
 /worker_data
+
+# Local benchmark reports
+benchmarks/

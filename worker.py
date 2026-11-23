@@ -302,6 +302,25 @@ def process_job(job: dict, client: WorkerClient, worker_device: str) -> None:
             shutil.rmtree(local_output, ignore_errors=True)
 
 
+def check_ai_benchmark(client: WorkerClient, worker_device: str) -> bool:
+    if worker_device != "cuda" or os.getenv("BENCHMARK_AI_ENABLED", "false").lower() != "true":
+        return False
+    claim_id = str(uuid.uuid4())
+    response = client._post(f"{API_BASE_URL}/api/worker/ai-benchmark/claim", payload={"claim_id": claim_id})
+    job = response.get("job")
+    if not job:
+        return False
+    try:
+        from app.ai_benchmark_worker import execute
+        report = execute(job)
+        payload = {"claim_id": claim_id, "results": report}
+    except Exception as exc:
+        log.exception("AI benchmark failed")
+        payload = {"claim_id": claim_id, "error": str(exc)[:700]}
+    client._post(f"{API_BASE_URL}/api/worker/ai-benchmark/{job['id']}/complete", payload=payload)
+    return True
+
+
 def main() -> int:
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
@@ -324,6 +343,9 @@ def main() -> int:
     try:
         while not STOP_REQUESTED.is_set():
             try:
+                if check_ai_benchmark(client, worker_device):
+                    idle_seconds = POLL_SECONDS
+                    continue
                 job = client.claim()
                 if job is None:
                     STOP_REQUESTED.wait(idle_seconds)

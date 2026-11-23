@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from app.upload_limits import UploadLimitsMiddleware
 
-from app import repository, s3_storage
+from app import repository, s3_storage, benchmark_service, ai_benchmark_service
 from app.ffmpeg_service import FULL_LADDER, ai_upscale_targets, build_quality_ladder, sort_qualities
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -360,6 +360,89 @@ def stream_hls_file(slug: str, object_path: str):
     except Exception as exc:
         log.exception("Failed to proxy S3 object %s", object_key)
         raise HTTPException(status_code=502, detail="Unable to retrieve HLS object from storage") from exc
+
+
+def _benchmark_authorized(request: Request) -> None:
+    """Benchmarks consume CPU/S3 resources; never expose without explicit opt-in."""
+    expected = os.getenv("BENCHMARK_ADMIN_TOKEN", "")
+    if os.getenv("BENCHMARK_ENABLED", "false").lower() != "true" or not expected:
+        raise HTTPException(status_code=503, detail="Benchmarks are disabled. Configure BENCHMARK_ENABLED=true and BENCHMARK_ADMIN_TOKEN.")
+    supplied = request.headers.get("x-benchmark-token", "")
+    if not supplied or not hmac.compare_digest(expected, supplied):
+        raise HTTPException(status_code=403, detail="Invalid benchmark access token")
+
+
+@app.get("/api/benchmark/config")
+def benchmark_config():
+    return {"enabled": os.getenv("BENCHMARK_ENABLED", "false").lower() == "true" and bool(os.getenv("BENCHMARK_ADMIN_TOKEN")),
+            "runtime": "API CPU and dedicated GPU worker", "ai_available": os.getenv("BENCHMARK_AI_ENABLED", "false").lower() == "true",
+            "info": "CPU benchmarks run on the API; AI benchmarks require BENCHMARK_AI_ENABLED=true and a running CUDA worker."}
+
+
+@app.post("/api/benchmark/start")
+def benchmark_start(request: Request, payload: dict = Body(...)):
+    _benchmark_authorized(request)
+    slug = payload.get("slug", "")
+    if not isinstance(slug, str):
+        raise HTTPException(status_code=400, detail="Invalid video selection")
+    _validate_slug(slug)
+    video = repository.get_video(slug)
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    try:
+        if payload.get("mode") == "ai":
+            if os.getenv("BENCHMARK_AI_ENABLED", "false").lower() != "true":
+                raise ValueError("AI benchmarks are disabled: configure BENCHMARK_AI_ENABLED=true")
+            return ai_benchmark_service.start(video, seconds=int(payload.get("seconds", 5)),
+                scale=int(payload.get("scale", 2)), model=str(payload.get("model", "realesr-animevideov3")),
+                tile=int(payload.get("tile", 384)), compare=payload.get("compare", False) is True,
+                candidate_tile=int(payload.get("candidate_tile", 256)),
+                comparison_rounds=int(payload.get("comparison_rounds", 1)),
+                candidate_model=(str(payload["candidate_model"]) if payload.get("candidate_model") else None))
+        seconds = int(payload.get("seconds", 5))
+        quality = str(payload.get("quality", "480p"))
+        presets = payload.get("presets", ["slow", "medium"])
+        if not isinstance(presets, list) or not all(isinstance(p, str) for p in presets):
+            raise ValueError("Invalid presets")
+        return benchmark_service.start(video, seconds=seconds, quality=quality, presets=presets)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/benchmark/{job_id}")
+def benchmark_status(job_id: str, request: Request):
+    _benchmark_authorized(request)
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(status_code=400, detail="Invalid benchmark ID")
+    result = ai_benchmark_service.get(job_id) or benchmark_service.get(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Benchmark not found (reports are held on this API instance)")
+    return result
+
+
+@app.post("/api/worker/ai-benchmark/claim")
+def ai_benchmark_claim(request: Request, payload: dict = Body(...)):
+    _worker_authorized(request)
+    if os.getenv("BENCHMARK_AI_ENABLED", "false").lower() != "true":
+        return {"job": None}
+    claim_id = str(payload.get("claim_id", ""))
+    if not JOB_ID_RE.fullmatch(claim_id):
+        raise HTTPException(status_code=422, detail="Invalid claim ID")
+    return {"job": ai_benchmark_service.claim(claim_id)}
+
+
+@app.post("/api/worker/ai-benchmark/{job_id}/complete")
+def ai_benchmark_complete(job_id: str, request: Request, payload: dict = Body(...)):
+    _worker_authorized(request)
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(status_code=400, detail="Invalid benchmark ID")
+    try:
+        return ai_benchmark_service.finish(job_id, str(payload.get("claim_id", "")),
+            results=payload.get("results"), error=payload.get("error"))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/upload")
