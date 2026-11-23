@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -19,7 +20,20 @@ def _required_env(name: str) -> str:
     return value
 
 
+_client = None
+_client_lock = threading.Lock()
+
+
 def get_client():
+    """Reuse the thread-safe client and connection pool for this process."""
+    global _client
+    with _client_lock:
+        if _client is None:
+            _client = _build_client()
+        return _client
+
+
+def _build_client():
     region = os.getenv("S3_REGION") or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
     endpoint = os.getenv("S3_ENDPOINT_URL", "").strip() or None
     access_key = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("S3_ACCESS_KEY_ID")
@@ -27,7 +41,7 @@ def get_client():
     session_token = os.getenv("AWS_SESSION_TOKEN") or None
     kwargs: dict[str, Any] = {
         "service_name": "s3", "region_name": region,
-        "config": Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "standard"}, connect_timeout=20, read_timeout=120),
+        "config": Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "standard"}, connect_timeout=20, read_timeout=120, max_pool_connections=32),
     }
     if endpoint:
         kwargs["endpoint_url"] = endpoint
@@ -147,7 +161,9 @@ def delete_prefix(bucket: str, prefix: str) -> None:
         for start in range(0, len(contents), 1000):
             batch = contents[start:start + 1000]
             if batch:
-                client.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": item["Key"]} for item in batch], "Quiet": True})
+                result = client.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": item["Key"]} for item in batch], "Quiet": True})
+                if result.get("Errors"):
+                    raise RuntimeError("Storage rejected one or more object deletions")
 
 
 def public_url(object_key: str) -> str:

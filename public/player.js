@@ -6,7 +6,7 @@
   const qualitySelect = $("#quality-select");
   const convertButton = $("#convert-button");
   const aiButton = $("#ai-button");
-  const state = { videos: [], activeSlug: null, activeQuality: "auto", hls: null, loadingUrl: null, pollTimer: null, busy: false };
+  const state = { videos: [], activeSlug: null, activeQuality: "auto", hls: null, loadingUrl: null, pollTimer: null, busy: false, uploadTimer: null };
 
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
@@ -148,6 +148,10 @@
     setQualityOptions(item);
     updateSidePanel(item);
     loadPlayback(item, "auto", false);
+    // Selecting an item is a direct user gesture: attempt inline playback immediately.
+    // Native controls remain available if the browser blocks or cannot decode the media.
+    video.play().catch(() => {});
+    $("#watch").scrollIntoView({ behavior: "smooth", block: "start" });
     showNotice(item.job_error ? `Last processing attempt: ${item.job_error}` : "", item.job_error ? "error" : "info");
   }
   async function refreshVideos() {
@@ -167,7 +171,15 @@
         updateSidePanel(fresh);
         // Do not interrupt current playback when another quality is published.
         // The new rendition appears in the quality selector immediately.
-        if (before !== after) showNotice(`New quality available: ${fresh.qualities.filter((q) => !(active.qualities || []).includes(q)).join(", ")}`, "success");
+        if (before !== after) {
+          const added = (fresh.qualities || []).filter((q) => !(previousActive?.qualities || []).includes(q));
+          if (added.length) showNotice(`New quality available: ${added.join(", ")}`, "success");
+        }
+        // Auto initially falls back to the original. Switch to HLS when the
+        // first rendition becomes playable without discarding playback position.
+        if (state.activeQuality === "auto" && !previousActive?.has_streams && fresh.has_streams && fresh.manifest_url) {
+          loadPlayback(fresh, "auto", true);
+        }
       }
     } catch (error) {
       showNotice(`Could not refresh the video library: ${error.message}`, "error");
@@ -208,6 +220,7 @@
     const button = $("#upload-button");
     const progress = $("#upload-progress");
     button.disabled = true;
+    if (state.uploadTimer) window.clearTimeout(state.uploadTimer);
     progress.hidden = false;
     $("#upload-status").textContent = `Uploading ${file.name}…`;
     try {
@@ -228,7 +241,7 @@
     } finally {
       state.busy = false;
       button.disabled = false;
-      window.setTimeout(() => { progress.hidden = true; }, 3200);
+      state.uploadTimer = window.setTimeout(() => { progress.hidden = true; state.uploadTimer = null; }, 2500);
     }
   });
   $("#video-file").addEventListener("change", (event) => {
@@ -249,6 +262,21 @@
   });
   video.addEventListener("error", () => {
     if (state.loadingUrl) showNotice("The selected stream could not be played. Try another quality or the original.", "error");
+  });
+  // The progress bar should never be visible before the user starts an upload.
+  $("#upload-progress").hidden = true;
+  $("#theater-button").addEventListener("click", () => {
+    const active = document.body.classList.toggle("theater-on");
+    $("#theater-button").setAttribute("aria-pressed", String(active));
+    $("#theater-button").textContent = active ? "Exit theater" : "Theater mode";
+    $("#watch").scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  $("#fullscreen-button").addEventListener("click", async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else if (video.requestFullscreen) await video.requestFullscreen();
+      else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
+    } catch (_) { showNotice("Fullscreen is not supported in this browser.", "error"); }
   });
   refreshVideos();
   state.pollTimer = window.setInterval(refreshVideos, 5000);

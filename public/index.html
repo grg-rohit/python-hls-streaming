@@ -46,10 +46,10 @@
           <div id="video-library" class="video-library"><div class="empty-state"><div class="empty-glyph">▧</div><strong>Your library is empty</strong><span>Upload a video to start building your stream library.</span></div></div>
         </section>
 
-        <aside class="player-section">
-          <div class="section-heading player-heading"><div><p class="eyebrow">NOW PLAYING</p><h2>Preview</h2></div><span class="live-pill" id="player-state">IDLE</span></div>
+        <section class="player-section" id="watch">
+          <div class="section-heading player-heading"><div><p class="eyebrow">WATCH</p><h2>Video player</h2></div><div class="player-tools"><span class="live-pill" id="player-state">IDLE</span><button type="button" class="text-button" id="theater-button" aria-pressed="false" title="Toggle theater mode">Theater mode</button><button type="button" class="text-button" id="fullscreen-button" title="Fullscreen video">⛶ Fullscreen</button></div></div>
           <div class="player-frame">
-            <video id="video-player" controls playsinline preload="metadata"></video>
+            <video id="video-player" controls playsinline preload="metadata" aria-label="Video playback"></video>
             <div class="player-placeholder" id="player-placeholder"><div class="play-glyph">▶</div><strong>Ready when you are</strong><span>Select a video from your library to preview it.</span></div>
           </div>
           <div class="player-meta"><div class="playing-title" id="playing-title">No video selected</div><div class="playing-subtitle" id="playing-subtitle">Original and HLS playback</div></div>
@@ -58,7 +58,7 @@
           <div class="processing-actions"><div><p class="eyebrow">PROCESSING</p><strong>Build your stream</strong><span id="process-description">Select a video to view processing options.</span></div><button id="convert-button" class="button button-secondary" disabled>Generate HLS</button></div>
           <div class="ai-panel" id="ai-panel" hidden><div class="ai-copy"><span class="ai-tag">OPTIONAL AI</span><strong>Enhance to higher qualities</strong><span id="ai-description">Available only when the source is 720p or lower.</span></div><div class="ai-actions"><select id="ai-scale" aria-label="AI upscale factor"><option value="2">2× upscale</option><option value="3">3× upscale</option><option value="4">4× upscale</option></select><button id="ai-button" class="button button-ai">Upscale</button></div></div>
           <div class="notice" id="notice" role="status" aria-live="polite"></div>
-        </aside>
+        </section>
       </div>
     </main>
     <footer><span>HLS STUDIO</span><span>Original-first · Progressive HLS · S3 storage</span></footer>

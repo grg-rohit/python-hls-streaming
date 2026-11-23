@@ -1,383 +1,316 @@
-#python-hls-streaming\app\repository.py
-"""Single-API S3 metadata repository for videos and worker jobs.
+﻿"""Single-process S3 repository: a mutation commits one authoritative catalog.
 
-Catalog/queue JSON objects use an in-process lock. Run exactly one API replica
-and one Uvicorn process until this repository is moved to transactional storage.
+Run one API process per metadata bucket. V1 queue/job records are imported on
+access; the next mutation writes v2. Stop old API/workers before upgrading.
 """
 from __future__ import annotations
 import copy
+import hmac
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from app import s3_storage
 
-META_PREFIX = "_app"
-CATALOG_KEY = f"{META_PREFIX}/catalog.json"
-QUEUE_KEY = f"{META_PREFIX}/queue.json"
+META_PREFIX = '_app'
+CATALOG_KEY = f'{META_PREFIX}/catalog.json'
+QUEUE_KEY = f'{META_PREFIX}/queue.json'
 _LOCK = threading.RLock()
 
 
-def utc_now() -> datetime:
+def utc_now():
     return datetime.now(timezone.utc)
 
 
-def timestamp(value: datetime | None = None) -> str:
-    return (value or utc_now()).isoformat(timespec="seconds")
+def timestamp(value=None):
+    return (value or utc_now()).isoformat(timespec='seconds')
 
 
-def _bucket() -> str:
+def _bucket():
     return s3_storage.streams_bucket()
 
 
-def _job_key(job_id: str) -> str:
-    return f"{META_PREFIX}/jobs/{job_id}.json"
+def _job_key(job_id):
+    return f'{META_PREFIX}/jobs/{job_id}.json'
 
 
-def _read_catalog() -> dict[str, Any]:
-    value = s3_storage.get_json(_bucket(), CATALOG_KEY, default=None)
-    if value is None:
-        return {"version": 1, "videos": {}}
-    if value.get("version") != 1 or not isinstance(value.get("videos"), dict):
-        raise RuntimeError("S3 catalog metadata has an unsupported or invalid format")
-    return value
+def _read_catalog():
+    catalog = s3_storage.get_json(_bucket(), CATALOG_KEY, default=None)
+    if catalog is None:
+        return {'version': 2, 'videos': {}, 'jobs': {}}
+    if catalog.get('version') not in {1, 2} or not isinstance(catalog.get('videos'), dict):
+        raise RuntimeError('Unsupported or invalid S3 catalog')
+    if catalog['version'] == 2:
+        if not isinstance(catalog.get('jobs'), dict):
+            raise RuntimeError('Invalid catalog jobs')
+        return catalog
+    # Recover jobs written to the old queue before a failed catalog update.
+    queue = s3_storage.get_json(_bucket(), QUEUE_KEY, default={})
+    ids = set(queue.get('job_ids', []))
+    embedded = {}
+    for video in catalog['videos'].values():
+        job = video.get('latest_job')
+        if job and job.get('id'):
+            embedded[job['id']] = job
+            ids.add(job['id'])
+    jobs = {}
+    for job_id in ids:
+        saved = s3_storage.get_json(_bucket(), _job_key(job_id), default=None)
+        latest = embedded.get(job_id)
+        # Completion in v1 could commit in the catalog before the job file.
+        job = latest if latest and (latest.get('status') == 'ready' or not saved or
+                                   latest.get('updated_at', '') > saved.get('updated_at', '')) else saved
+        if not job or job.get('slug') not in catalog['videos']:
+            continue
+        job = copy.deepcopy(job)
+        if job.get('status') == 'processing':
+            job.update(status='queued', lease_expires_at=None)
+        job.pop('lease_token', None)
+        jobs[job_id] = job
+    for slug, video in catalog['videos'].items():
+        active = [j for j in jobs.values() if j['slug'] == slug and j['status'] == 'queued']
+        preferred = (video.get('latest_job') or {}).get('id')
+        active.sort(key=lambda j: (j['id'] != preferred, j.get('created_at', ''), j['id']))
+        if active:
+            video['latest_job'] = copy.deepcopy(active[0])
+            for duplicate in active[1:]:
+                duplicate.update(status='failed', error='Duplicate retired during migration', lease_expires_at=None)
+        elif preferred in jobs:
+            video['latest_job'] = copy.deepcopy(jobs[preferred])
+    catalog.update(version=2, jobs=jobs)
+    return catalog
 
 
-def _write_catalog(catalog: dict[str, Any]) -> None:
+def _write_catalog(catalog):
     s3_storage.put_json(_bucket(), CATALOG_KEY, catalog)
 
 
-def _read_queue() -> list[str]:
-    value = s3_storage.get_json(_bucket(), QUEUE_KEY, default=None)
-    if value is None:
-        return []
-    ids = value.get("job_ids", [])
-    if not isinstance(ids, list):
-        raise RuntimeError("S3 worker queue metadata is invalid")
-    return [str(item) for item in ids if isinstance(item, str)]
-
-
-def _write_queue(job_ids: list[str]) -> None:
-    s3_storage.put_json(_bucket(), QUEUE_KEY, {"version": 1, "job_ids": list(dict.fromkeys(job_ids))})
-
-
-def _set_video(video: dict[str, Any]) -> None:
-    catalog = _read_catalog()
-    catalog["videos"][video["slug"]] = video
+def _commit_job(catalog, job):
+    catalog['jobs'][job['id']] = job
+    video = catalog['videos'][job['slug']]
+    video['latest_job'] = copy.deepcopy(job)
+    video['updated_at'] = job['updated_at']
     _write_catalog(catalog)
 
 
-def get_video(slug: str) -> dict[str, Any] | None:
-    video = _read_catalog()["videos"].get(slug)
-    return copy.deepcopy(video) if video else None
+@contextmanager
+def video_transaction():
+    """Serialize check/upload/register and check/delete against job creation."""
+    with _LOCK:
+        yield
 
 
-def list_videos() -> list[dict[str, Any]]:
-    videos = [copy.deepcopy(value) for value in _read_catalog()["videos"].values()]
-    return sorted(videos, key=lambda item: str(item.get("filename", "")).casefold())
+def get_video(slug):
+    with _LOCK:
+        return copy.deepcopy(_read_catalog()['videos'].get(slug))
 
 
-def upsert_video(slug: str, filename: str, original_key: str, size_bytes: int) -> dict[str, Any]:
+def list_videos():
+    with _LOCK:
+        return sorted(copy.deepcopy(list(_read_catalog()['videos'].values())), key=lambda v: v['filename'].casefold())
+
+
+def _new_video(slug, filename, original_key, size_bytes):
+    return dict(slug=slug, filename=filename, original_key=original_key, size_bytes=int(size_bytes),
+                has_streams=False, qualities=[], stream_prefix='', quality_prefixes={}, source_width=None,
+                source_height=None, created_at=timestamp(), updated_at=timestamp(), latest_job=None)
+
+
+def upsert_video(slug, filename, original_key, size_bytes):
     with _LOCK:
         catalog = _read_catalog()
-        existing = catalog["videos"].get(slug)
-        now = timestamp()
-        if existing:
-            existing.update(filename=filename, original_key=original_key, size_bytes=int(size_bytes), updated_at=now)
-            video = existing
-        else:
-            video = {
-                "slug": slug, "filename": filename, "original_key": original_key,
-                "size_bytes": int(size_bytes), "has_streams": False, "qualities": [],
-                "stream_prefix": "", "quality_prefixes": {}, "source_width": None,
-                "source_height": None, "created_at": now, "updated_at": now,
-                "latest_job": None,
-            }
-            catalog["videos"][slug] = video
+        video = catalog['videos'].setdefault(slug, _new_video(slug, filename, original_key, size_bytes))
+        video.update(filename=filename, original_key=original_key, size_bytes=int(size_bytes), updated_at=timestamp())
         _write_catalog(catalog)
         return copy.deepcopy(video)
 
 
-def set_legacy_streams(slug: str, qualities: list[str], stream_prefix: str = "") -> None:
+def import_legacy_video(slug, filename, original_key, size_bytes):
     with _LOCK:
         catalog = _read_catalog()
-        video = catalog["videos"].get(slug)
-        if not video:
-            return
-        prefix = stream_prefix.strip("/")
-        video["has_streams"] = bool(qualities)
-        video["qualities"] = list(qualities)
-        video["stream_prefix"] = prefix
-        video["quality_prefixes"] = {quality: prefix for quality in qualities}
-        video["updated_at"] = timestamp()
-        _write_catalog(catalog)
-
-
-def get_job(job_id: str) -> dict[str, Any] | None:
-    return s3_storage.get_json(_bucket(), _job_key(job_id), default=None)
-
-
-def _save_job(job: dict[str, Any]) -> None:
-    s3_storage.put_json(_bucket(), _job_key(str(job["id"])), job)
-
-
-def _update_latest_video_job(job: dict[str, Any]) -> None:
-    catalog = _read_catalog()
-    video = catalog["videos"].get(str(job["slug"]))
-    if not video:
-        raise RuntimeError(f"Video metadata disappeared for job {job['id']}")
-    video["latest_job"] = copy.deepcopy(job)
-    video["updated_at"] = timestamp()
-    _write_catalog(catalog)
-
-
-def create_job(slug: str, mode: str = "auto", job_type: str = "hls", options: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    with _LOCK:
-        catalog = _read_catalog()
-        video = catalog["videos"].get(slug)
-        if not video:
-            return None
-        latest = video.get("latest_job") or {}
-        if latest.get("status") in {"queued", "processing"}:
-            # Do not silently return a different type of in-flight job.
-            if latest.get("job_type") == job_type and latest.get("mode") == mode and (latest.get("options") or {}) == (options or {}):
-                return copy.deepcopy(latest)
-            return None
-        now = timestamp()
-        job = {
-            "id": str(uuid.uuid4()), "slug": slug, "job_type": job_type, "mode": mode,
-            "options": copy.deepcopy(options or {}),
-            "required_capability": "gpu" if mode == "gpu" or (options or {}).get("device") == "cuda" else "cpu",
-            "status": "queued", "attempts": 0, "error": None, "created_at": now,
-            "updated_at": now, "started_at": None, "completed_at": None,
-            "lease_expires_at": None, "qualities": [],
-        }
-        _save_job(job)
-        _write_queue(_read_queue() + [job["id"]])
-        video["latest_job"] = copy.deepcopy(job)
-        video["updated_at"] = now
-        _write_catalog(catalog)
-        return copy.deepcopy(job)
-
-
-def latest_job(slug: str) -> dict[str, Any] | None:
-    video = get_video(slug)
-    return copy.deepcopy(video.get("latest_job")) if video else None
-
-
-def claim_next_job(stale_minutes: int = 1440, capabilities: list[str] | None = None) -> dict[str, Any] | None:
-    """Claim a compatible queued job, or reclaim an expired worker lease."""
-    worker_capabilities = set(capabilities or ["cpu"])
-    if not worker_capabilities.intersection({"cpu", "gpu"}):
-        worker_capabilities.add("cpu")
-    with _LOCK:
-        queue_ids = _read_queue()
-        retained: list[str] = []
-        now = utc_now()
-        expiry_text = timestamp(now + timedelta(minutes=max(10, stale_minutes)))
-        for position, job_id in enumerate(queue_ids):
-            job = get_job(job_id)
-            if not job or job.get("status") not in {"queued", "processing"}:
-                continue
-            options = job.get("options") or {}
-            required = str(job.get("required_capability") or ("gpu" if job.get("mode") == "gpu" or options.get("device") == "cuda" else "cpu"))
-            if required not in worker_capabilities:
-                retained.append(job_id)
-                continue
-            if job.get("status") == "processing":
-                try:
-                    expired = not job.get("lease_expires_at") or datetime.fromisoformat(job["lease_expires_at"]) <= now
-                except (TypeError, ValueError):
-                    expired = True
-                if not expired:
-                    retained.append(job_id)
-                    continue
-            job.update(required_capability=required, status="processing", started_at=timestamp(now), updated_at=timestamp(now), lease_expires_at=expiry_text, attempts=int(job.get("attempts", 0)) + 1, error=None)
-            _save_job(job)
-            _update_latest_video_job(job)
-            video = get_video(str(job["slug"]))
-            if not video:
-                raise RuntimeError(f"Original video metadata not found for job {job_id}")
-            job["original_key"] = video["original_key"]
-            job["filename"] = video["filename"]
-            job["existing_qualities"] = list(video.get("qualities") or [])
-            job["quality_prefixes"] = dict(video.get("quality_prefixes") or {})
-            job["source_width"] = video.get("source_width")
-            job["source_height"] = video.get("source_height")
-            # Keep processing jobs in the queue document so another worker can
-            # reclaim them once the lease expires after a worker/node failure.
-            retained.append(job_id)
-            _write_queue(retained + queue_ids[position + 1:])
-            return job
-        _write_queue(retained)
-        return None
-
-
-def heartbeat_job(job_id: str, lease_minutes: int = 1440) -> dict[str, Any] | None:
-    with _LOCK:
-        job = get_job(job_id)
-        if not job or job.get("status") != "processing":
-            return None
-        now = utc_now()
-        job["updated_at"] = timestamp(now)
-        job["lease_expires_at"] = timestamp(now + timedelta(minutes=max(10, lease_minutes)))
-        _save_job(job)
-        _update_latest_video_job(job)
-        return job
-
-
-def publish_quality(job_id: str, quality: str, qualities: list[str], source_width: int, source_height: int) -> dict[str, Any] | None:
-    """Commit one quality only after its playlist, segments and master exist in S3."""
-    with _LOCK:
-        job = get_job(job_id)
-        if not job or job.get("status") != "processing":
-            return None
-        slug = str(job["slug"])
-        catalog = _read_catalog()
-        video = catalog["videos"].get(slug)
-        if not video:
-            raise RuntimeError(f"Video metadata disappeared for job {job_id}")
-        current = set(video.get("qualities") or [])
-        current.add(quality)
-        # The worker sends the full manifest order; merge it with any other
-        # qualities published by previous jobs to avoid accidentally dropping them.
-        current.update(str(value) for value in qualities)
-        ordered = _quality_sort(list(current))
-        prefixes = dict(video.get("quality_prefixes") or {})
-        prefixes[quality] = f"jobs/{job_id}"
-        # Only the newly completed quality comes from this job. Other qualities
-        # may live under an earlier HLS or AI job prefix and must keep that mapping.
-        video.update(
-            has_streams=True,
-            qualities=ordered,
-            stream_prefix=f"jobs/{job_id}",
-            quality_prefixes=prefixes,
-            source_width=int(source_width),
-            source_height=int(source_height),
-            updated_at=timestamp(),
-        )
-        job["qualities"] = ordered
-        job["updated_at"] = timestamp()
-        job["source_width"] = int(source_width)
-        job["source_height"] = int(source_height)
-        video["latest_job"] = copy.deepcopy(job)
-        _write_catalog(catalog)
-        _save_job(job)
-        return copy.deepcopy(job)
-
-
-def _quality_sort(names: list[str]) -> list[str]:
-    order = {"240p": 0, "360p": 1, "480p": 2, "720p": 3, "1080p": 4, "1440p": 5, "2160p": 6}
-    return sorted(set(names), key=lambda name: order.get(name, 999))
-
-
-def complete_job(job_id: str, qualities: list[str]) -> dict[str, Any] | None:
-    with _LOCK:
-        job = get_job(job_id)
-        if not job or job.get("status") != "processing":
-            return None
-        now_text = timestamp()
-        job.update(status="ready", error=None, updated_at=now_text, completed_at=now_text, lease_expires_at=None)
-        catalog = _read_catalog()
-        video = catalog["videos"].get(str(job["slug"]))
-        if not video:
-            raise RuntimeError(f"Video metadata disappeared for completed job {job_id}")
-        all_qualities = _quality_sort(list(set(video.get("qualities") or []) | set(qualities)))
-        video["has_streams"] = bool(all_qualities)
-        video["qualities"] = all_qualities
-        video["stream_prefix"] = f"jobs/{job_id}"
-        # Keep prior quality-prefix mappings; AI jobs add only new higher rungs.
-        prefixes = dict(video.get("quality_prefixes") or {})
-        for q in qualities:
-            prefixes.setdefault(q, f"jobs/{job_id}")
-        video["quality_prefixes"] = prefixes
-        job["qualities"] = all_qualities
-        video["latest_job"] = copy.deepcopy(job)
-        video["updated_at"] = now_text
-        _write_catalog(catalog)
-        _save_job(job)
-        _write_queue([item for item in _read_queue() if item != job_id])
-        return copy.deepcopy(job)
-
-
-def fail_job(job_id: str, error: str) -> dict[str, Any] | None:
-    with _LOCK:
-        job = get_job(job_id)
-        if not job:
-            return None
-        catalog = _read_catalog()
-        video = catalog["videos"].get(str(job["slug"]))
-        latest = (video or {}).get("latest_job") or {}
-        if latest.get("id") == job_id and latest.get("status") == "ready":
-            recovered = copy.deepcopy(latest)
-            _save_job(recovered)
-            _write_queue([item for item in _read_queue() if item != job_id])
-            return recovered
-        if job.get("status") == "ready":
-            _write_queue([item for item in _read_queue() if item != job_id])
-            return job
-        now_text = timestamp()
-        job.update(status="failed", error=(error or "Unknown worker error")[:8000], updated_at=now_text, completed_at=now_text, lease_expires_at=None)
-        _save_job(job)
-        if video:
-            video["latest_job"] = copy.deepcopy(job)
-            video["updated_at"] = now_text
-            _write_catalog(catalog)
-        _write_queue([item for item in _read_queue() if item != job_id])
-        return job
-
-
-def active_job_for_slug(slug: str) -> dict[str, Any] | None:
-    job = latest_job(slug)
-    return job if job and job.get("status") in {"queued", "processing"} else None
-
-
-def remove_video(slug: str) -> None:
-    with _LOCK:
-        catalog = _read_catalog()
-        catalog["videos"].pop(slug, None)
-        _write_catalog(catalog)
-        queue = _read_queue()
-        remove_ids: set[str] = set()
-        for item in s3_storage.list_files(_bucket(), prefix=f"{META_PREFIX}/jobs/"):
-            key = item.get("Key", "")
-            job = s3_storage.get_json(_bucket(), key, default=None)
-            if job and job.get("slug") == slug:
-                remove_ids.add(str(job.get("id", "")))
-                s3_storage.delete_object(_bucket(), key)
-        _write_queue([job_id for job_id in queue if job_id not in remove_ids])
-
-
-def clear_streams(slug: str) -> None:
-    with _LOCK:
-        catalog = _read_catalog()
-        video = catalog["videos"].get(slug)
-        if not video:
-            return
-        video.update(has_streams=False, qualities=[], stream_prefix="", quality_prefixes={}, latest_job=None, updated_at=timestamp())
-        _write_catalog(catalog)
-        queue = _read_queue()
-        remove_ids: set[str] = set()
-        for item in s3_storage.list_files(_bucket(), prefix=f"{META_PREFIX}/jobs/"):
-            key = item.get("Key", "")
-            job = s3_storage.get_json(_bucket(), key, default=None)
-            if job and job.get("slug") == slug:
-                remove_ids.add(str(job.get("id", "")))
-                s3_storage.delete_object(_bucket(), key)
-        _write_queue([job_id for job_id in queue if job_id not in remove_ids])
-
-
-def import_legacy_video(slug: str, filename: str, original_key: str, size_bytes: int) -> bool:
-    with _LOCK:
-        catalog = _read_catalog()
-        if slug in catalog["videos"]:
+        if slug in catalog['videos']:
             return False
-        now = timestamp()
-        catalog["videos"][slug] = {
-            "slug": slug, "filename": filename, "original_key": original_key,
-            "size_bytes": int(size_bytes), "has_streams": False, "qualities": [],
-            "stream_prefix": "", "quality_prefixes": {}, "source_width": None,
-            "source_height": None, "created_at": now, "updated_at": now, "latest_job": None,
-        }
+        catalog['videos'][slug] = _new_video(slug, filename, original_key, size_bytes)
         _write_catalog(catalog)
         return True
+
+
+def set_legacy_streams(slug, qualities, stream_prefix=''):
+    with _LOCK:
+        catalog = _read_catalog()
+        video = catalog['videos'].get(slug)
+        if not video:
+            return
+        prefix = stream_prefix.strip('/')
+        video.update(has_streams=bool(qualities), qualities=list(qualities), stream_prefix=prefix,
+                     quality_prefixes={q: prefix for q in qualities}, updated_at=timestamp())
+        _write_catalog(catalog)
+
+
+def get_job(job_id):
+    with _LOCK:
+        return copy.deepcopy(_read_catalog()['jobs'].get(job_id))
+
+
+def create_job(slug, mode='auto', job_type='hls', options=None):
+    with _LOCK:
+        catalog = _read_catalog()
+        video = catalog['videos'].get(slug)
+        if not video:
+            return None
+        latest = video.get('latest_job') or {}
+        if latest.get('status') in {'queued', 'processing'}:
+            matches = latest.get('job_type') == job_type and latest.get('mode') == mode and latest.get('options', {}) == (options or {})
+            return copy.deepcopy(latest) if matches else None
+        now = timestamp()
+        job = dict(id=str(uuid.uuid4()), slug=slug, job_type=job_type, mode=mode, options=copy.deepcopy(options or {}),
+                   required_capability='gpu' if mode == 'gpu' or (options or {}).get('device') == 'cuda' else 'cpu',
+                   status='queued', attempts=0, error=None, created_at=now, updated_at=now, started_at=None,
+                   completed_at=None, lease_expires_at=None, qualities=[])
+        _commit_job(catalog, job)
+        return copy.deepcopy(job)
+
+
+def latest_job(slug):
+    video = get_video(slug)
+    return video.get('latest_job') if video else None
+
+
+def active_job_for_slug(slug):
+    job = latest_job(slug)
+    return job if job and job.get('status') in {'queued', 'processing'} else None
+
+
+def _expired(job):
+    try:
+        return datetime.fromisoformat(job['lease_expires_at']) <= utc_now()
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def lease_matches(job, token, *, terminal=False):
+    if not job or not token or not hmac.compare_digest(str(job.get('lease_token', '')), token):
+        return False
+    return (terminal and job['status'] in {'ready', 'failed'}) or (job['status'] == 'processing' and not _expired(job))
+
+
+def _claim_payload(catalog, job):
+    result = copy.deepcopy(job)
+    video = catalog['videos'][job['slug']]
+    for key in ('original_key', 'filename', 'quality_prefixes', 'source_width', 'source_height'):
+        result[key] = copy.deepcopy(video.get(key))
+    result['existing_qualities'] = list(video.get('qualities', []))
+    return result
+
+
+def claim_next_job(stale_minutes=60, capabilities=None, *, claim_id):
+    with _LOCK:
+        catalog = _read_catalog()
+        # A lost response returns the original lease, never claims another job.
+        for job in catalog['jobs'].values():
+            if job.get('claim_id') == claim_id:
+                return _claim_payload(catalog, job) if job['status'] == 'processing' and not _expired(job) else None
+        supported = set(capabilities or ['cpu'])
+        for job in sorted(catalog['jobs'].values(), key=lambda j: (j['created_at'], j['id'])):
+            if job['status'] not in {'queued', 'processing'} or job.get('required_capability', 'cpu') not in supported:
+                continue
+            if job['status'] == 'processing' and not _expired(job):
+                continue
+            token = str(uuid.uuid4())
+            now = utc_now()
+            job.update(status='processing', started_at=timestamp(now), updated_at=timestamp(now), error=None,
+                       lease_expires_at=timestamp(now + timedelta(minutes=max(1, stale_minutes))),
+                       attempts=int(job.get('attempts', 0)) + 1, lease_token=token, claim_id=claim_id,
+                       output_prefix=f"jobs/{job['id']}/attempts/{token}")
+            _commit_job(catalog, job)
+            return _claim_payload(catalog, job)
+        return None  # Idle polling is read-only.
+
+
+def heartbeat_job(job_id, lease_minutes=60, *, lease_token):
+    with _LOCK:
+        catalog = _read_catalog()
+        job = catalog['jobs'].get(job_id)
+        if not lease_matches(job, lease_token):
+            return None
+        now = utc_now()
+        job.update(updated_at=timestamp(now), lease_expires_at=timestamp(now + timedelta(minutes=max(1, lease_minutes))))
+        _commit_job(catalog, job)
+        return copy.deepcopy(job)
+
+
+def _quality_sort(names):
+    return sorted(set(names), key=lambda q: int(q.rstrip('p')))
+
+
+def publish_quality(job_id, quality, qualities, source_width, source_height, *, lease_token):
+    with _LOCK:
+        catalog = _read_catalog()
+        job = catalog['jobs'].get(job_id)
+        if not lease_matches(job, lease_token):
+            return None
+        video = catalog['videos'][job['slug']]
+        # Add only the rendition verified by the API, never unverified labels.
+        ordered = _quality_sort(list(video.get('qualities', [])) + [quality])
+        prefixes = dict(video.get('quality_prefixes', {}))
+        prefixes[quality] = job['output_prefix']
+        video.update(has_streams=True, qualities=ordered, quality_prefixes=prefixes,
+                     stream_prefix=job['output_prefix'], source_width=source_width, source_height=source_height)
+        job.update(qualities=ordered, source_width=source_width, source_height=source_height, updated_at=timestamp())
+        _commit_job(catalog, job)
+        return copy.deepcopy(job)
+
+
+def complete_job(job_id, qualities, *, lease_token):
+    with _LOCK:
+        catalog = _read_catalog()
+        job = catalog['jobs'].get(job_id)
+        if not lease_matches(job, lease_token, terminal=True) or job['status'] == 'failed':
+            return None
+        if job['status'] == 'ready':
+            return copy.deepcopy(job) if set(qualities) == set(job['qualities']) else None
+        video = catalog['videos'][job['slug']]
+        if set(qualities) != set(video.get('qualities', [])) or not qualities:
+            return None
+        video['stream_prefix'] = job['output_prefix']
+        job.update(status='ready', qualities=_quality_sort(qualities), error=None, updated_at=timestamp(),
+                   completed_at=timestamp(), lease_expires_at=None)
+        _commit_job(catalog, job)
+        return copy.deepcopy(job)
+
+
+def fail_job(job_id, error, *, lease_token):
+    with _LOCK:
+        catalog = _read_catalog()
+        job = catalog['jobs'].get(job_id)
+        if not lease_matches(job, lease_token, terminal=True):
+            return None
+        if job['status'] in {'ready', 'failed'}:
+            return copy.deepcopy(job)
+        job.update(status='failed', error=(error or 'Unknown worker error')[:8000], updated_at=timestamp(),
+                   completed_at=timestamp(), lease_expires_at=None)
+        _commit_job(catalog, job)
+        return copy.deepcopy(job)
+
+
+def _remove_jobs(catalog, slug):
+    catalog['jobs'] = {key: job for key, job in catalog['jobs'].items() if job['slug'] != slug}
+
+
+def remove_video(slug):
+    with _LOCK:
+        catalog = _read_catalog()
+        catalog['videos'].pop(slug, None)
+        _remove_jobs(catalog, slug)
+        _write_catalog(catalog)
+
+
+def clear_streams(slug):
+    with _LOCK:
+        catalog = _read_catalog()
+        video = catalog['videos'].get(slug)
+        if not video:
+            return
+        video.update(has_streams=False, qualities=[], stream_prefix='', quality_prefixes={}, latest_job=None, updated_at=timestamp())
+        _remove_jobs(catalog, slug)
+        _write_catalog(catalog)

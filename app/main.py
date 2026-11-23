@@ -8,14 +8,17 @@ import mimetypes
 import os
 import posixpath
 import re
+import threading
 from base64 import b64decode
 from pathlib import Path
 from urllib.parse import quote
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Body
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
+from app.upload_limits import UploadLimitsMiddleware
 
 from app import repository, s3_storage
 from app.ffmpeg_service import FULL_LADDER, ai_upscale_targets, build_quality_ladder, sort_qualities
@@ -36,15 +39,15 @@ RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     try:
-        imported = _sync_existing_originals()
-        log.info("HLS API v5.0 started; %d video(s) registered (%d imported)", len(repository.list_videos()), imported)
+        imported = await run_in_threadpool(_sync_existing_originals)
+        log.info("HLS API v5.1 started; %d video(s) registered (%d imported)", len(await run_in_threadpool(repository.list_videos)), imported)
     except Exception:
         log.exception("S3 startup synchronization failed")
         raise
     yield
 
 
-app = FastAPI(title="HLS Streaming Server", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="HLS Streaming Server", version="5.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(PUBLIC_DIR), check_dir=False), name="static")
 
 
@@ -66,6 +69,17 @@ def _worker_authorized(request: Request) -> None:
         raise HTTPException(status_code=503, detail="Worker authentication is not configured")
     if not supplied or not hmac.compare_digest(expected, supplied):
         raise HTTPException(status_code=401, detail="Invalid worker token")
+
+
+def _lease_token(request: Request) -> str:
+    token = request.headers.get("x-job-lease", "")
+    if not JOB_ID_RE.fullmatch(token):
+        raise HTTPException(status_code=409, detail="A valid job lease is required")
+    return token
+
+
+_upload_lock = threading.Lock()
+_upload_slugs: set[str] = set()
 
 
 def _app_auth_enabled() -> bool:
@@ -234,16 +248,16 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "5.0.0", "metadata_store": "s3"}
+    return {"status": "ok", "version": "5.1.0", "metadata_store": "s3"}
 
 
 @app.get("/api/videos")
-async def list_videos():
+def list_videos():
     return {"videos": [_video_payload(video) for video in repository.list_videos()]}
 
 
 @app.get("/api/stream-info/{slug}")
-async def stream_info(slug: str):
+def stream_info(slug: str):
     _validate_slug(slug)
     video = repository.get_video(slug)
     if not video:
@@ -304,12 +318,10 @@ def stream_hls_file(slug: str, object_path: str):
         quality = parts[0]
         if not QUALITY_RE.fullmatch(quality):
             raise HTTPException(status_code=404, detail="Unknown rendition")
-        storage_prefix = str(quality_prefixes.get(quality) or "").strip("/")
-        # Legacy records without per-quality map used one shared stream prefix.
-        if not storage_prefix and quality in (video.get("qualities") or []):
-            storage_prefix = str(video.get("stream_prefix") or "").strip("/")
-        if not storage_prefix:
+        if quality not in (video.get("qualities") or []):
             raise HTTPException(status_code=404, detail="Rendition is not available")
+        # Empty prefix is valid for imported legacy streams.
+        storage_prefix = str(quality_prefixes.get(quality, video.get("stream_prefix") or "")).strip("/")
     object_key = f"{slug}/{storage_prefix + '/' if storage_prefix else ''}{object_path}"
     extension = Path(object_path).suffix.lower()
     try:
@@ -351,40 +363,49 @@ def stream_hls_file(slug: str, object_path: str):
 
 
 @app.post("/api/upload")
-async def upload_video(file: UploadFile = File(...)):
+def upload_video(file: UploadFile = File(...)):
     filename = _safe_filename(file.filename)
     from app.ffmpeg_service import VIDEO_EXTENSIONS, slugify
     extension = Path(filename).suffix.lower()
     if extension not in VIDEO_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported file type '{extension}'. Allowed: {', '.join(VIDEO_EXTENSIONS)}")
     slug = _validate_slug(slugify(filename))
-    if repository.get_video(slug):
-        raise HTTPException(status_code=409, detail=f"A video with slug '{slug}' already exists")
-    max_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024**3)))
-    object_key = f"videos/{slug}/{filename}"
+    with _upload_lock:
+        if slug in _upload_slugs:
+            raise HTTPException(status_code=409, detail="This video is already being uploaded")
+        _upload_slugs.add(slug)
     try:
-        file.file.seek(0, 2)
-        size = int(file.file.tell())
-        file.file.seek(0)
-        if size <= 0:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
-        if max_bytes > 0 and size > max_bytes:
-            raise HTTPException(status_code=413, detail=f"Upload exceeds {max_bytes} bytes")
-        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        s3_storage.upload_fileobj(file.file, s3_storage.originals_bucket(), object_key, content_type=content_type)
-        repository.upsert_video(slug, filename, object_key, size)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.exception("Original upload or metadata save failed")
-        raise HTTPException(status_code=502, detail="Could not store original video and metadata in S3") from exc
+        if repository.get_video(slug):
+            raise HTTPException(status_code=409, detail=f"A video with slug '{slug}' already exists")
+        max_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024**3)))
+        object_key = f"videos/{slug}/{filename}"
+        try:
+            file.file.seek(0, 2)
+            size = int(file.file.tell())
+            file.file.seek(0)
+            if size <= 0:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty")
+            if max_bytes > 0 and size > max_bytes:
+                raise HTTPException(status_code=413, detail=f"Upload exceeds {max_bytes} bytes")
+            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            s3_storage.upload_fileobj(file.file, s3_storage.originals_bucket(), object_key, content_type=content_type)
+            repository.upsert_video(slug, filename, object_key, size)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.exception("Original upload or metadata save failed")
+            raise HTTPException(status_code=502, detail="Could not store original video and metadata in S3") from exc
+        finally:
+            file.file.close()
+        return JSONResponse({"slug": slug, "filename": filename, "status": "original_only", "original_url": f"/api/original/{slug}", "message": "Original uploaded and is playable. Request standard HLS processing when ready."}, status_code=201)
+
     finally:
-        await file.close()
-    return JSONResponse({"slug": slug, "filename": filename, "status": "original_only", "original_url": f"/api/original/{slug}", "message": "Original uploaded and is playable. Request standard HLS processing when ready."}, status_code=201)
+        with _upload_lock:
+            _upload_slugs.discard(slug)
 
 
 @app.post("/api/convert/{slug}")
-async def request_conversion(slug: str, mode: str = "auto", job_type: str = "hls", scale: int = 2, tile: int | None = None):
+def request_conversion(slug: str, mode: str = "auto", job_type: str = "hls", scale: int = 2, tile: int | None = None):
     _validate_slug(slug)
     if mode not in ALLOWED_MODES:
         raise HTTPException(status_code=400, detail=f"mode must be one of {sorted(ALLOWED_MODES)}")
@@ -458,7 +479,7 @@ async def request_conversion(slug: str, mode: str = "auto", job_type: str = "hls
 
 
 @app.get("/api/convert/{slug}/status")
-async def conversion_status(slug: str):
+def conversion_status(slug: str):
     _validate_slug(slug)
     video = repository.get_video(slug)
     if not video:
@@ -467,34 +488,31 @@ async def conversion_status(slug: str):
 
 
 @app.delete("/api/videos/{slug}")
-async def delete_video(slug: str, delete_source: bool = False):
-    _validate_slug(slug)
-    video = repository.get_video(slug)
-    if not video:
-        raise HTTPException(status_code=404, detail="Video not found")
-    if repository.active_job_for_slug(slug):
-        raise HTTPException(status_code=409, detail="Cannot delete a video while a worker is processing it")
-    try:
-        s3_storage.delete_prefix(s3_storage.streams_bucket(), f"{slug}/")
-        if delete_source:
-            s3_storage.delete_prefix(s3_storage.originals_bucket(), f"videos/{slug}/")
-            repository.remove_video(slug)
-        else:
-            repository.clear_streams(slug)
-    except Exception as exc:
-        log.exception("Could not delete video %s", slug)
-        raise HTTPException(status_code=502, detail="Could not delete video objects/metadata from S3") from exc
-    return {"slug": slug, "deleted_streams": True, "source_deleted": delete_source}
+def delete_video(slug: str, delete_source: bool = False):
+    with repository.video_transaction():
+        _validate_slug(slug)
+        video = repository.get_video(slug)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        if repository.active_job_for_slug(slug):
+            raise HTTPException(status_code=409, detail="Cannot delete a video while a worker is processing it")
+        try:
+            s3_storage.delete_prefix(s3_storage.streams_bucket(), f"{slug}/")
+            if delete_source:
+                s3_storage.delete_prefix(s3_storage.originals_bucket(), f"videos/{slug}/")
+                repository.remove_video(slug)
+            else:
+                repository.clear_streams(slug)
+        except Exception as exc:
+            log.exception("Could not delete video %s", slug)
+            raise HTTPException(status_code=502, detail="Could not delete video objects/metadata from S3") from exc
+        return {"slug": slug, "deleted_streams": True, "source_deleted": delete_source}
 
 
 # Authenticated worker API: S3 credentials are never exposed to the browser.
 @app.post("/api/worker/jobs/claim")
-async def worker_claim(request: Request):
+def worker_claim(request: Request, payload: dict = Body(...)):
     _worker_authorized(request)
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
     capabilities = payload.get("capabilities", ["cpu"]) if isinstance(payload, dict) else ["cpu"]
     if not isinstance(capabilities, list):
         raise HTTPException(status_code=400, detail="capabilities must be an array")
@@ -502,24 +520,27 @@ async def worker_claim(request: Request):
     if not capabilities:
         capabilities = ["cpu"]
     stale_minutes = int(os.getenv("WORKER_JOB_STALE_MINUTES", "60"))
-    job = repository.claim_next_job(stale_minutes=max(10, stale_minutes), capabilities=capabilities)
+    claim_id = payload.get("claim_id", "")
+    if not isinstance(claim_id, str) or not JOB_ID_RE.fullmatch(claim_id):
+        raise HTTPException(status_code=400, detail="A UUID claim_id is required")
+    job = repository.claim_next_job(stale_minutes=max(1, stale_minutes), capabilities=capabilities, claim_id=claim_id)
     return {"job": job}
 
 
 @app.post("/api/worker/jobs/{job_id}/heartbeat")
-async def worker_heartbeat(job_id: str, request: Request):
+def worker_heartbeat(job_id: str, request: Request):
     _worker_authorized(request)
     if not JOB_ID_RE.fullmatch(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
     stale_minutes = int(os.getenv("WORKER_JOB_STALE_MINUTES", "60"))
-    job = repository.heartbeat_job(job_id, stale_minutes)
+    job = repository.heartbeat_job(job_id, stale_minutes, lease_token=_lease_token(request))
     if not job:
         raise HTTPException(status_code=409, detail="Job is no longer processing")
     return {"job_id": job_id, "status": "processing"}
 
 
 @app.post("/api/worker/jobs/{job_id}/quality-ready")
-async def worker_quality_ready(job_id: str, request: Request):
+def worker_quality_ready(job_id: str, request: Request, payload: dict = Body(...)):
     """Publish a finished rendition in the catalog without waiting for other rungs."""
     _worker_authorized(request)
     if not JOB_ID_RE.fullmatch(job_id):
@@ -527,56 +548,50 @@ async def worker_quality_ready(job_id: str, request: Request):
     job = repository.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.get("status") != "processing":
-        raise HTTPException(status_code=409, detail="Job is not currently processing")
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not repository.lease_matches(job, _lease_token(request), terminal=True):
+        raise HTTPException(status_code=409, detail="Job lease is no longer owned by this worker")
     quality = payload.get("quality") if isinstance(payload, dict) else None
     qualities = payload.get("qualities", []) if isinstance(payload, dict) else []
     try:
         width, height = int(payload["source_width"]), int(payload["source_height"])
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=400, detail="source_width and source_height are required integers")
+    if width <= 0 or height <= 0:
+        raise HTTPException(status_code=400, detail="Source dimensions must be positive")
     if not isinstance(quality, str) or not QUALITY_RE.fullmatch(quality):
         raise HTTPException(status_code=400, detail="Invalid quality label")
     if not isinstance(qualities, list) or not all(isinstance(value, str) and QUALITY_RE.fullmatch(value) for value in qualities):
         raise HTTPException(status_code=400, detail="qualities must be an array of valid quality labels")
     slug = str(job["slug"])
-    job_prefix = f"{slug}/jobs/{job_id}"
+    job_prefix = f"{slug}/{job['output_prefix']}"
     bucket = s3_storage.streams_bucket()
     if not s3_storage.object_exists(bucket, f"{job_prefix}/{quality}/playlist.m3u8"):
         raise HTTPException(status_code=409, detail="Rendition playlist was not uploaded")
     if not s3_storage.object_exists(bucket, f"{job_prefix}/master.m3u8"):
         raise HTTPException(status_code=409, detail="Progressive master playlist was not uploaded")
-    result = repository.publish_quality(job_id, quality, qualities, width, height)
+    result = repository.publish_quality(job_id, quality, qualities, width, height, lease_token=_lease_token(request))
     if not result:
         raise HTTPException(status_code=409, detail="Job is no longer processing")
     return {"job_id": job_id, "status": "processing", "quality": quality, "qualities": result.get("qualities", [])}
 
 
 @app.post("/api/worker/jobs/{job_id}/complete")
-async def worker_complete(job_id: str, request: Request):
+def worker_complete(job_id: str, request: Request, payload: dict = Body(...)):
     _worker_authorized(request)
     if not JOB_ID_RE.fullmatch(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
     job = repository.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.get("status") != "processing":
-        raise HTTPException(status_code=409, detail="Job is not currently processing")
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not repository.lease_matches(job, _lease_token(request), terminal=True):
+        raise HTTPException(status_code=409, detail="Job lease is no longer owned by this worker")
     qualities = payload.get("qualities", []) if isinstance(payload, dict) else []
     if not isinstance(qualities, list) or not qualities or not all(isinstance(q, str) and QUALITY_RE.fullmatch(q) for q in qualities):
         raise HTTPException(status_code=400, detail="Worker must provide a non-empty qualities array")
-    master_key = f"{job['slug']}/jobs/{job_id}/master.m3u8"
+    master_key = f"{job['slug']}/{job['output_prefix']}/master.m3u8"
     if not s3_storage.object_exists(s3_storage.streams_bucket(), master_key):
         raise HTTPException(status_code=409, detail="Uploaded HLS master playlist was not found in S3")
-    result = repository.complete_job(job_id, qualities)
+    result = repository.complete_job(job_id, qualities, lease_token=_lease_token(request))
     if not result:
         raise HTTPException(status_code=409, detail="Job could not be marked complete")
     log.info("Worker completed job %s; qualities now available: %s", job_id, qualities)
@@ -584,16 +599,12 @@ async def worker_complete(job_id: str, request: Request):
 
 
 @app.post("/api/worker/jobs/{job_id}/fail")
-async def worker_fail(job_id: str, request: Request):
+def worker_fail(job_id: str, request: Request, payload: dict = Body(...)):
     _worker_authorized(request)
     if not JOB_ID_RE.fullmatch(job_id):
         raise HTTPException(status_code=400, detail="Invalid job ID")
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
     error = str(payload.get("error", "Worker reported a failure")) if isinstance(payload, dict) else "Worker reported a failure"
-    result = repository.fail_job(job_id, error)
+    result = repository.fail_job(job_id, error, lease_token=_lease_token(request))
     if not result:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"job_id": job_id, "status": result["status"]}
@@ -602,3 +613,6 @@ async def worker_fail(job_id: str, request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000)
+
+
+app.add_middleware(UploadLimitsMiddleware)

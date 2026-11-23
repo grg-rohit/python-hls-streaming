@@ -33,7 +33,7 @@ spec:
       terminationGracePeriodSeconds: 21600
       containers:
         - name: worker
-          image: ghcr.io/REPLACE_ME/python-hls-worker-gpu:0.1.0
+          image: ghcr.io/grg-rohit/python-hls-worker-gpu:0.1.0
           imagePullPolicy: IfNotPresent
           command: ["python", "worker.py"]
           env:

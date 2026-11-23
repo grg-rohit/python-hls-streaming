@@ -9,6 +9,8 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
+import random
 from pathlib import Path
 from urllib.parse import quote
 import requests
@@ -67,6 +69,14 @@ def resolve_worker_device() -> tuple[str, list[str], str | None]:
     return actual, capabilities, gpu_name
 
 
+class CallbackDeliveryError(RuntimeError):
+    """Transient callback delivery exhausted: leave job recoverable via lease expiry."""
+
+
+class LeaseLostError(RuntimeError):
+    """A newer attempt owns the job; this worker must stop publishing."""
+
+
 class WorkerClient:
     def __init__(self, capabilities: list[str]) -> None:
         if not WORKER_TOKEN:
@@ -74,31 +84,59 @@ class WorkerClient:
         self.capabilities = capabilities
         self.session = requests.Session()
         self.session.headers.update({"X-Worker-Token": WORKER_TOKEN})
+        self.lease_token: str | None = None
+        self._pending_claim_id: str | None = None
+
+    def _post(self, url: str, *, payload: dict | None = None, lease=False, attempts=5) -> dict:
+        headers = {"X-Job-Lease": self.lease_token} if lease and self.lease_token else {}
+        for attempt in range(attempts):
+            try:
+                response = self.session.post(url, json=payload, headers=headers, timeout=(10, 60))
+                if lease and response.status_code in {401, 403, 404, 409}:
+                    raise LeaseLostError(f"Lease callback rejected ({response.status_code})")
+                # Retry only temporary failures; never retry invalid payloads or permissions.
+                if response.status_code not in {408, 425, 429, 500, 502, 503, 504}:
+                    response.raise_for_status()
+                    return response.json()
+                response.raise_for_status()
+            except LeaseLostError:
+                raise
+            except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+                if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code not in {408, 425, 429, 500, 502, 503, 504}:
+                    raise
+                if attempt == attempts - 1:
+                    if lease:
+                        raise CallbackDeliveryError("Callback delivery uncertain; job will be retried after lease expiry") from exc
+                    raise
+                time.sleep(min(12, 0.6 * (2 ** attempt)) + random.uniform(0, 0.25))
+        raise RuntimeError("Request retries exhausted")
 
     def claim(self) -> dict | None:
-        response = self.session.post(f"{API_BASE_URL}/api/worker/jobs/claim", json={"capabilities": self.capabilities}, timeout=(10, 60))
-        response.raise_for_status()
-        return response.json().get("job")
+        # Retain the claim_id across network errors so a lost claim response
+        # cannot cause us to claim a second job while the first is processing.
+        if self._pending_claim_id is None:
+            self._pending_claim_id = str(uuid.uuid4())
+        response = self._post(f"{API_BASE_URL}/api/worker/jobs/claim",
+                              payload={"capabilities": self.capabilities, "claim_id": self._pending_claim_id})
+        self._pending_claim_id = None
+        job = response.get("job")
+        self.lease_token = str(job["lease_token"]) if job else None
+        return job
 
     def quality_ready(self, job_id: str, quality: str, qualities: list[str], source_width: int, source_height: int) -> None:
-        response = self.session.post(
-            f"{API_BASE_URL}/api/worker/jobs/{quote(job_id, safe='')}/quality-ready",
-            json={"quality": quality, "qualities": qualities, "source_width": source_width, "source_height": source_height},
-            timeout=(10, 60),
-        )
-        response.raise_for_status()
+        self._post(f"{API_BASE_URL}/api/worker/jobs/{quote(job_id, safe='')}/quality-ready",
+                   payload={"quality": quality, "qualities": qualities, "source_width": source_width, "source_height": source_height}, lease=True)
 
     def complete(self, job_id: str, qualities: list[str]) -> None:
-        response = self.session.post(f"{API_BASE_URL}/api/worker/jobs/{quote(job_id, safe='')}/complete", json={"qualities": qualities}, timeout=(10, 60))
-        response.raise_for_status()
+        self._post(f"{API_BASE_URL}/api/worker/jobs/{quote(job_id, safe='')}/complete",
+                   payload={"qualities": qualities}, lease=True)
 
     def heartbeat(self, job_id: str) -> None:
-        response = self.session.post(f"{API_BASE_URL}/api/worker/jobs/{quote(job_id, safe='')}/heartbeat", timeout=(10, 30))
-        response.raise_for_status()
+        self._post(f"{API_BASE_URL}/api/worker/jobs/{quote(job_id, safe='')}/heartbeat", lease=True, attempts=3)
 
     def fail(self, job_id: str, error: str) -> None:
-        response = self.session.post(f"{API_BASE_URL}/api/worker/jobs/{quote(job_id, safe='')}/fail", json={"error": error[:8000]}, timeout=(10, 60))
-        response.raise_for_status()
+        self._post(f"{API_BASE_URL}/api/worker/jobs/{quote(job_id, safe='')}/fail",
+                   payload={"error": error[:8000]}, lease=True, attempts=3)
 
     def close(self) -> None:
         self.session.close()
@@ -138,17 +176,22 @@ def process_job(job: dict, client: WorkerClient, worker_device: str) -> None:
     options = job.get("options") or {}
     if job_type not in {"hls", "ai_upscale"}:
         raise RuntimeError(f"Unsupported job type: {job_type}")
-    local_slug = f"{slug}-{job_id[:8]}"
-    object_prefix = f"{slug}/jobs/{job_id}"
+    local_slug = f"{slug}-{job_id[:8]}-{str(job['lease_token'])[:8]}"
+    object_prefix = f"{slug}/{job['output_prefix']}"
     local_output = stream_dir(local_slug)
     if local_output.exists():
         shutil.rmtree(local_output)
     heartbeat_stop = threading.Event()
+    lease_lost = threading.Event()
 
     def heartbeat_loop() -> None:
         while not heartbeat_stop.wait(HEARTBEAT_SECONDS):
             try:
                 client.heartbeat(job_id)
+            except LeaseLostError:
+                lease_lost.set()
+                log.error("Lease revoked for job %s; worker will stop before publication", job_id)
+                return
             except Exception:
                 log.warning("Could not renew lease for job %s", job_id, exc_info=True)
 
@@ -206,9 +249,13 @@ def process_job(job: dict, client: WorkerClient, worker_device: str) -> None:
             # this job publishes only newly generated higher renditions.
             def on_quality_ready(quality: dict, completed_local: list[str]) -> None:
                 name = str(quality["name"])
+                if lease_lost.is_set():
+                    raise LeaseLostError("Lease revoked during encoding")
                 _upload_rendition(local_slug, object_prefix, name)
                 combined = sort_qualities(published_names + completed_local)
                 _publish_master(local_slug, object_prefix, combined, source_width, source_height)
+                if lease_lost.is_set():
+                    raise LeaseLostError("Lease revoked before quality publication")
                 client.quality_ready(job_id, name, combined, source_width, source_height)
                 if name not in published_names:
                     published_names.append(name)
@@ -234,12 +281,15 @@ def process_job(job: dict, client: WorkerClient, worker_device: str) -> None:
             # Reassert a final combined master. It points to each rendition by its
             # quality name; the API maps each quality to its own immutable S3 job prefix.
             _publish_master(local_slug, object_prefix, all_qualities, source_width, source_height)
+            if lease_lost.is_set():
+                raise LeaseLostError("Lease revoked before completion")
             client.complete(job_id, all_qualities)
             log.info("Job %s completed; all available qualities: %s", job_id, ", ".join(all_qualities))
     except Exception as exc:
         log.exception("Job %s failed", job_id)
         try:
-            client.fail(job_id, f"{type(exc).__name__}: {exc}")
+            if not isinstance(exc, (LeaseLostError, CallbackDeliveryError)):
+                client.fail(job_id, f"{type(exc).__name__}: {exc}")
         except Exception:
             log.exception("Could not report failure for job %s", job_id)
         raise
@@ -247,6 +297,7 @@ def process_job(job: dict, client: WorkerClient, worker_device: str) -> None:
         heartbeat_stop.set()
         thread.join(timeout=5)
         ACTIVE_JOB.clear()
+        client.lease_token = None
         if local_output.exists():
             shutil.rmtree(local_output, ignore_errors=True)
 
@@ -269,13 +320,16 @@ def main() -> int:
         encoder = None
     log.info("FFmpeg hardware encoder: %s", encoder or "none; CPU encoding")
     log.info("Scratch: %s; FrameLift cache: %s", WORKER_DATA_DIR, os.getenv("FRAMELIFT_WEIGHTS"))
+    idle_seconds = POLL_SECONDS
     try:
         while not STOP_REQUESTED.is_set():
             try:
                 job = client.claim()
                 if job is None:
-                    STOP_REQUESTED.wait(POLL_SECONDS)
+                    STOP_REQUESTED.wait(idle_seconds)
+                    idle_seconds = min(60, max(POLL_SECONDS, idle_seconds * 2))
                     continue
+                idle_seconds = POLL_SECONDS
                 try:
                     process_job(job, client, worker_device)
                 except Exception:
