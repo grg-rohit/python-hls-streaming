@@ -89,6 +89,8 @@ def _app_auth_enabled() -> bool:
 @app.middleware("http")
 async def optional_basic_auth(request: Request, call_next):
     path = request.url.path
+    if os.getenv("REQUIRE_APP_AUTH", "false").lower() == "true" and not _app_auth_enabled() and path != "/health" and not path.startswith("/api/worker/"):
+        return JSONResponse({"detail": "Application authentication is not configured"}, status_code=503)
     if _app_auth_enabled() and path != "/health" and not path.startswith("/api/worker/"):
         auth = request.headers.get("authorization", "")
         valid = False
