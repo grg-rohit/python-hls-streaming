@@ -1,4 +1,4 @@
-﻿"""Single-process S3 repository: a mutation commits one authoritative catalog.
+"""Single-process S3 repository: a mutation commits one authoritative catalog.
 
 Run one API process per metadata bucket. V1 queue/job records are imported on
 access; the next mutation writes v2. Stop old API/workers before upgrading.
@@ -6,6 +6,7 @@ access; the next mutation writes v2. Stop old API/workers before upgrading.
 from __future__ import annotations
 import copy
 import hmac
+import os
 import threading
 import uuid
 from contextlib import contextmanager
@@ -152,7 +153,20 @@ def get_job(job_id):
         return copy.deepcopy(_read_catalog()['jobs'].get(job_id))
 
 
+def job_routing(mode, job_type, options=None):
+    """Production hybrid policy is opt-in; preserve standalone defaults."""
+    options = copy.deepcopy(options or {})
+    if os.getenv('HYBRID_DEPLOYMENT', 'false').lower() == 'true':
+        if job_type == 'ai_upscale':
+            options['device'] = 'cuda'
+            return 'auto', options, 'gpu'
+        return 'cpu', options, 'cpu'
+    capability = 'gpu' if mode == 'gpu' or options.get('device') == 'cuda' else 'cpu'
+    return mode, options, capability
+
+
 def create_job(slug, mode='auto', job_type='hls', options=None):
+    mode, options, capability = job_routing(mode, job_type, options)
     with _LOCK:
         catalog = _read_catalog()
         video = catalog['videos'].get(slug)
@@ -160,11 +174,12 @@ def create_job(slug, mode='auto', job_type='hls', options=None):
             return None
         latest = video.get('latest_job') or {}
         if latest.get('status') in {'queued', 'processing'}:
-            matches = latest.get('job_type') == job_type and latest.get('mode') == mode and latest.get('options', {}) == (options or {})
+            latest_mode, latest_options, _ = job_routing(latest.get('mode', 'auto'), latest.get('job_type', 'hls'), latest.get('options'))
+            matches = latest.get('job_type') == job_type and latest_mode == mode and latest_options == options
             return copy.deepcopy(latest) if matches else None
         now = timestamp()
         job = dict(id=str(uuid.uuid4()), slug=slug, job_type=job_type, mode=mode, options=copy.deepcopy(options or {}),
-                   required_capability='gpu' if mode == 'gpu' or (options or {}).get('device') == 'cuda' else 'cpu',
+                   required_capability=capability,
                    status='queued', attempts=0, error=None, created_at=now, updated_at=now, started_at=None,
                    completed_at=None, lease_expires_at=None, qualities=[])
         _commit_job(catalog, job)
@@ -212,10 +227,18 @@ def claim_next_job(stale_minutes=60, capabilities=None, *, claim_id):
                 return _claim_payload(catalog, job) if job['status'] == 'processing' and not _expired(job) else None
         supported = set(capabilities or ['cpu'])
         for job in sorted(catalog['jobs'].values(), key=lambda j: (j['created_at'], j['id'])):
-            if job['status'] not in {'queued', 'processing'} or job.get('required_capability', 'cpu') not in supported:
+            if job['status'] not in {'queued', 'processing'}:
                 continue
             if job['status'] == 'processing' and not _expired(job):
                 continue
+            # Normalize pending legacy jobs only when hybrid routing is enabled.
+            if os.getenv('HYBRID_DEPLOYMENT', 'false').lower() == 'true':
+                mode, options, capability = job_routing(job.get('mode', 'auto'), job.get('job_type', 'hls'), job.get('options'))
+            else:
+                mode, options, capability = job.get('mode', 'auto'), job.get('options', {}), job.get('required_capability', 'cpu')
+            if capability not in supported:
+                continue
+            job.update(mode=mode, options=options, required_capability=capability)
             token = str(uuid.uuid4())
             now = utc_now()
             job.update(status='processing', started_at=timestamp(now), updated_at=timestamp(now), error=None,

@@ -47,3 +47,15 @@ app/.env
 
 # Local benchmark reports
 benchmarks/
+
+# Terraform local state and environment configuration
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+crash.log
+
+# Remote worker secrets and scratch
+app/.env.remote-gpu
+/worker_data_remote/

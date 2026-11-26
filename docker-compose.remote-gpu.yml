@@ -1,0 +1,33 @@
+# Standalone remote worker: no local API or CPU worker is started.
+services:
+  worker-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      args:
+        TORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
+        TORCH_VERSION: "2.14.1"
+    image: hls-worker:gpu
+    restart: unless-stopped
+    env_file: app/.env.remote-gpu
+    environment:
+      API_BASE_URL: ${REMOTE_API_URL:-http://host.docker.internal:18000}
+      WORKER_DEVICE: cuda
+      WORKER_CAPABILITIES: gpu
+      AI_ENCODER: nvenc
+      AI_HALF: "true"
+      BENCHMARK_AI_ENABLED: "false"
+      WORKER_DATA_DIR: /app/worker_data
+      FRAMELIFT_WEIGHTS: /app/worker_data/framelift_weights
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    command: ["python", "worker.py"]
+    volumes:
+      - ./worker_data_remote:/app/worker_data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -16,3 +16,6 @@ graphify-out
 tests
 *.log
 token.txt
+
+worker_data_remote
+**/.env.remote-gpu

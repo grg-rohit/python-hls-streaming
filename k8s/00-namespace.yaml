@@ -1,7 +1,0 @@
-#python-hls-streaming\k8s\00-namespace.yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: hls
-  labels:
-    app.kubernetes.io/part-of: python-hls-streaming

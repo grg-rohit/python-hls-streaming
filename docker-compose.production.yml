@@ -1,0 +1,11 @@
+services:
+  server:
+    environment:
+      HYBRID_DEPLOYMENT: "true"
+      AI_REQUIRED_DEVICE: cuda
+    ports: !override
+      - "127.0.0.1:8000:8000"
+    volumes: !reset []
+  worker-cpu:
+    environment:
+      WORKER_CAPABILITIES: cpu

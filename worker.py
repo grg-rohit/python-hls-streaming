@@ -66,6 +66,12 @@ def resolve_worker_device() -> tuple[str, list[str], str | None]:
     if actual == "cuda":
         capabilities.append("gpu")
         gpu_name = torch.cuda.get_device_name(0)
+    configured = os.getenv("WORKER_CAPABILITIES", "").strip()
+    if configured:
+        requested = list(dict.fromkeys(part.strip().lower() for part in configured.split(",")))
+        if not requested or any(part not in capabilities for part in requested):
+            raise RuntimeError("WORKER_CAPABILITIES must be a subset of available capabilities: " + ",".join(capabilities))
+        capabilities = requested
     return actual, capabilities, gpu_name
 
 
@@ -91,7 +97,9 @@ class WorkerClient:
         headers = {"X-Job-Lease": self.lease_token} if lease and self.lease_token else {}
         for attempt in range(attempts):
             try:
-                response = self.session.post(url, json=payload, headers=headers, timeout=(10, 60))
+                response = self.session.post(url, json=payload, headers=headers, timeout=(10, 60), allow_redirects=False)
+                if 300 <= response.status_code < 400:
+                    raise RuntimeError("Worker API redirects are not allowed; configure the final API URL")
                 if lease and response.status_code in {401, 403, 404, 409}:
                     raise LeaseLostError(f"Lease callback rejected ({response.status_code})")
                 # Retry only temporary failures; never retry invalid payloads or permissions.
